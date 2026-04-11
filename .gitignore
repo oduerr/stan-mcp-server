@@ -1,0 +1,25 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+.venv/
+venv/
+*.egg
+
+# uv
+.uv/
+uv.lock
+
+# Stan model cache (compiled binaries)
+/tmp/stan_mcp_model_cache/
+
+# Results / datasets (local data — not versioned)
+results/
+datasets/
+
+# Editor
+.DS_Store
+.vscode/
+*.swp

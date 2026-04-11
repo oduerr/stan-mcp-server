@@ -1,0 +1,25 @@
+[project]
+name = "stan-mcp-server"
+version = "0.1.0"
+description = "Standalone CmdStan MCP Server — structured Bayesian modelling tools for LLM agents"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "fastmcp>=2.0",
+    "cmdstanpy>=1.2",
+    "numpy>=1.24",
+    "scipy>=1.10",
+]
+
+[project.optional-dependencies]
+dev = ["pytest"]
+
+[project.scripts]
+stan-mcp-server = "stan_mcp_server.server:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["stan_mcp_server"]
