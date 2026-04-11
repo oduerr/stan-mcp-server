@@ -1,10 +1,11 @@
-# PLEASE NOTE THIS IS WORK IN PROGRESS NOT READY FOR USE yet! JUST A PRIVATE PROOF OF CONCEPT FOR NOW NEEDED TO MAKE PUBLIC REPO DUE TO EASE.
-
 # Stan MCP Server
 
 A standalone MCP server that gives an LLM agent structured access to
 CmdStan/CmdStanPy over HTTP.  The agent receives compact JSON — never raw
 sampler output.
+
+Large datasets are uploaded directly from the client to the server's HTTP
+upload endpoint, so CSV content never passes through LLM context.
 
 ## Quick start
 
@@ -21,7 +22,8 @@ stan-mcp-server \
   --results-dir  /path/to/results
 ```
 
-The server listens at `http://127.0.0.1:8765/mcp` by default.
+The MCP server listens at `http://127.0.0.1:8765/mcp` and the HTTP upload
+endpoint at `http://127.0.0.1:8766/dataset/{name}` by default.
 
 ## Prerequisites
 
@@ -45,24 +47,32 @@ pip install -e .
 stan-mcp-server \
   --datasets-dir /path/to/datasets \
   --results-dir  /path/to/results \
-  --host 127.0.0.1 \   # default
-  --port 8765           # default
+  --host 127.0.0.1 \     # default
+  --port 8765 \          # MCP endpoint (default)
+  --upload-port 8766     # HTTP upload endpoint (default; 0 to disable)
 ```
 
-The server listens at `http://<host>:<port>/mcp` using the
-[MCP streamable-http transport](https://spec.modelcontextprotocol.io/).
+Startup output:
+
+```
+Stan MCP Server starting on http://127.0.0.1:8765/mcp
+  datasets : /path/to/datasets
+  results  : /path/to/results
+  cache    : /tmp/stan_mcp_model_cache
+  upload   : http://127.0.0.1:8766/dataset/{name}
+```
 
 ## Tools
 
 | Tool | Purpose |
 |------|---------|
-| `get_capabilities` | Query available tools and server configuration |
+| `get_capabilities` | Query available tools, server configuration, and upload URL |
 | `list_datasets` | List pre-staged and uploaded datasets |
 | `get_data_summary` | Compact EDA for a named dataset |
 | `check_model` | Compile-only check (syntax + `log_lik` presence) |
-| `fit_and_evaluate` | Sample + compute NLPD on held-out test responses |
-| `sample` | Sample + return raw posterior draws |
-| `upload_dataset` | Push train/test CSV content to the server at runtime |
+| `fit_and_evaluate` | Sample + compute NLPD; returns scalar diagnostics + run asset URLs |
+| `sample` | Sample; returns scalar diagnostics + run asset URLs |
+| `get_upload_instructions` | Return HTTP upload URL and field names for datasets |
 | `get_run_history` | Return the logged NLPD history for a dataset |
 
 **Recommended call order for an AutoStan loop:**
@@ -84,25 +94,84 @@ Add to `~/Library/Application Support/Claude/claude_desktop_config.json`:
 
 For a remote server, add a bearer token (see **Security** below).
 
-## Uploading datasets at runtime
+## Run assets — logs and posterior draws
 
-For remote servers where pre-staging files via rsync/scp is not practical,
-use `upload_dataset` to push CSV content over the MCP connection:
+Every `sample` and `fit_and_evaluate` call persists results server-side under
+a short `run_id` and returns only scalar diagnostics plus two URLs.  Bulk data
+**never enters LLM context**.
 
-```python
-upload_dataset(
-    name="my_experiment",
-    train_csv="x,y\n1.0,2.1\n...",
-    test_csv="x,y\n3.0,4.2\n...",
-    dataset_md="..."  # optional, for type annotations
-)
+```json
+{
+  "run_id":      "3a7f9c1e20b4",
+  "nlpd":        1.423,
+  "r_hat_max":   1.003,
+  "n_divergences": 0,
+  "ess_bulk_min": 2841,
+  "runtime_sec": 4.2,
+  "logs_url":    "http://127.0.0.1:8766/logs/3a7f9c1e20b4",
+  "samples_url": "http://127.0.0.1:8766/samples/3a7f9c1e20b4"
+}
 ```
 
-The tool returns the qualified name `_uploaded/my_experiment`, which is
-then used in subsequent calls:
+| Endpoint | Returns |
+|---|---|
+| `GET /logs/{run_id}` | CmdStan stdout/stderr as plain text |
+| `GET /samples/{run_id}` | Per-chain Stan CSV files as a `.tar.gz` |
+
+Download samples:
+
+```bash
+curl http://127.0.0.1:8766/samples/3a7f9c1e20b4 -o samples.tar.gz
+tar xf samples.tar.gz          # expands to per-chain *.csv
+```
+
+Load in Python (requires `cmdstanpy` or `arviz`):
 
 ```python
-fit_and_evaluate(stan_code=..., dataset="_uploaded/my_experiment")
+import arviz as az
+idata = az.from_cmdstan(["model-1.csv", "model-2.csv", "model-3.csv", "model-4.csv"])
+```
+
+Run assets are stored under `<results-dir>/_runs/<run_id>/` and are never
+automatically deleted.
+
+## Uploading datasets at runtime
+
+Datasets must be uploaded via the HTTP endpoint so that CSV content —
+including **test labels** — never passes through LLM context.  The LLM calls
+`get_upload_instructions()` to retrieve the URL and field names, then passes
+them to the user or an automated client.
+
+### HTTP upload endpoint
+
+```bash
+curl -X POST http://127.0.0.1:8766/dataset/my_experiment \
+     -F train=@train.csv \
+     -F test=@test.csv \
+     -F dataset_md=@dataset.md   # optional
+```
+
+Or from Python:
+
+```python
+import requests
+
+with open("train.csv") as tr, open("test.csv") as te:
+    r = requests.post(
+        "http://127.0.0.1:8766/dataset/my_experiment",
+        files={"train": tr, "test": te},
+    )
+r.raise_for_status()
+print(r.json())   # {"status": "ok", "dataset": "_uploaded/my_experiment", ...}
+```
+
+After a successful upload pass `_uploaded/my_experiment` to
+`fit_and_evaluate` / `get_data_summary`.
+
+To disable the HTTP endpoint entirely:
+
+```bash
+stan-mcp-server --datasets-dir ... --results-dir ... --upload-port 0
 ```
 
 Uploaded datasets are stored under `<datasets-dir>/_uploaded/` on the server.

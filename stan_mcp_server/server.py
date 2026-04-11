@@ -3,14 +3,20 @@
 
 Serves tools over HTTP (streamable-http transport):
 
-    fit_and_evaluate   Sample + compute NLPD on held-out test responses.
-    sample             Sample + return raw posterior draws.
-    check_model        Compile-only model check (syntax + log_lik presence).
-    get_data_summary   Compact EDA for a named dataset.
-    upload_dataset     Push train/test CSV content to the server.
-    list_datasets      List available datasets on the server.
-    get_run_history    Return the logged run history for a dataset.
-    get_capabilities   Describe tools and current server configuration.
+    fit_and_evaluate        Sample + compute NLPD; returns run_id + diagnostics + URLs.
+    sample                  Sample + persist draws to disk; returns run_id + diagnostics + URLs.
+    check_model             Compile-only model check (syntax + log_lik presence).
+    get_data_summary        Compact EDA for a named dataset.
+    get_upload_instructions Return HTTP upload URL and field names for datasets.
+    list_datasets           List available datasets on the server.
+    get_run_history         Return the logged run history for a dataset.
+    get_capabilities        Describe tools and current server configuration.
+
+Run assets (logs, posterior draws) are stored server-side under
+<results-dir>/_runs/<run_id>/ and served by the HTTP sidecar:
+    GET /logs/{run_id}     — CmdStan log output (plain text)
+    GET /samples/{run_id}  — posterior draw CSVs (tar.gz)
+    POST /dataset/{name}   — upload train/test CSVs (multipart)
 
 Usage
 -----
@@ -19,24 +25,36 @@ Usage
 """
 
 import argparse
+import contextlib
 import csv
 import hashlib
+import io
 import json
+import logging
 import re
 import socket
+import tarfile
 import tempfile
+import threading
 import time
+import uuid
 from pathlib import Path
 from typing import Optional
 
 import numpy as np
+import uvicorn
+from fastapi import FastAPI, File, Form, HTTPException, Response, UploadFile
+from fastapi.responses import PlainTextResponse
 from fastmcp import FastMCP
 from scipy.special import logsumexp
 
 # ── Global path config (set by main() before the server starts) ────────────────
-_DATASETS_DIR: Path = Path("datasets")
-_RESULTS_DIR:  Path = Path("results")
-_MODEL_CACHE:  Path = Path(tempfile.gettempdir()) / "stan_mcp_model_cache"
+_DATASETS_DIR:  Path = Path("datasets")
+_RESULTS_DIR:   Path = Path("results")
+_MODEL_CACHE:   Path = Path(tempfile.gettempdir()) / "stan_mcp_model_cache"
+_UPLOAD_PORT:   int  = 8766          # 0 = disabled
+_UPLOAD_HOST:   str  = "127.0.0.1"
+_UPLOAD_DIR:    str  = "_uploaded"
 
 # ── Default sampling config ────────────────────────────────────────────────────
 _DEFAULT_CONFIG = {
@@ -46,9 +64,132 @@ _DEFAULT_CONFIG = {
     "seed": 42,
 }
 
+# ── Shared dataset-save logic (used by both MCP tool and HTTP endpoint) ────────
+
+def _save_dataset(
+    name: str,
+    train_csv: str,
+    test_csv: str,
+    dataset_md: Optional[str] = None,
+) -> dict:
+    """Validate name, write files, sanity-check CSVs.  Returns a status dict."""
+    if not re.fullmatch(r'[A-Za-z0-9_\-]+', name):
+        return {
+            "status": "error",
+            "message": "Dataset name may only contain letters, digits, underscores, and hyphens.",
+        }
+
+    ds_dir        = _DATASETS_DIR / _UPLOAD_DIR / name
+    protected_dir = ds_dir / "protected"
+    protected_dir.mkdir(parents=True, exist_ok=True)
+
+    (ds_dir / "train.csv").write_text(train_csv)
+    (protected_dir / "test.csv").write_text(test_csv)
+    if dataset_md is not None:
+        (ds_dir / "dataset.md").write_text(dataset_md)
+
+    try:
+        train_cols = _load_csv_columns(ds_dir / "train.csv")
+        test_cols  = _load_csv_columns(protected_dir / "test.csv")
+    except Exception as exc:
+        return {"status": "error", "message": f"CSV parse error: {exc}"}
+
+    return {
+        "status": "ok",
+        "dataset": f"{_UPLOAD_DIR}/{name}",
+        "n_train": len(next(iter(train_cols.values()))),
+        "n_test":  len(next(iter(test_cols.values()))),
+        "train_columns": list(train_cols.keys()),
+        "test_columns":  list(test_cols.keys()),
+    }
+
+
+# ── HTTP upload app (runs on --upload-port in a daemon thread) ─────────────────
+
+_upload_app = FastAPI(title="Stan dataset upload", docs_url=None, redoc_url=None)
+
+
+@_upload_app.post("/dataset/{name}")
+async def _http_upload_dataset(
+    name: str,
+    train: UploadFile = File(..., description="Training CSV (including header row)"),
+    test:  UploadFile = File(..., description="Held-out test CSV (including header row)"),
+    dataset_md: Optional[str] = Form(None, description="Optional dataset.md content"),
+) -> dict:
+    """Upload train/test CSVs for a dataset via multipart POST.
+
+    Equivalent to the MCP upload_dataset tool but without the 500 kB payload
+    limit — suitable for large files that should not pass through LLM context.
+    """
+    train_csv = (await train.read()).decode()
+    test_csv  = (await test.read()).decode()
+    return _save_dataset(name, train_csv, test_csv, dataset_md)
+
+
+@_upload_app.get("/logs/{run_id}")
+async def _http_get_logs(run_id: str) -> PlainTextResponse:
+    """Return the captured CmdStan log output for a run."""
+    if not re.fullmatch(r"[0-9a-f]{12}", run_id):
+        raise HTTPException(status_code=400, detail="invalid run_id")
+    logs_file = _RESULTS_DIR / "_runs" / run_id / "logs.txt"
+    if not logs_file.exists():
+        raise HTTPException(status_code=404, detail=f"run '{run_id}' not found")
+    return PlainTextResponse(logs_file.read_text())
+
+
+@_upload_app.get("/samples/{run_id}")
+async def _http_get_samples(run_id: str) -> Response:
+    """Return posterior draw CSVs for a run as a gzipped tar archive."""
+    if not re.fullmatch(r"[0-9a-f]{12}", run_id):
+        raise HTTPException(status_code=400, detail="invalid run_id")
+    samples_dir = _RESULTS_DIR / "_runs" / run_id / "samples"
+    if not samples_dir.exists():
+        raise HTTPException(status_code=404, detail=f"run '{run_id}' not found")
+    buf = io.BytesIO()
+    with tarfile.open(fileobj=buf, mode="w:gz") as tar:
+        for csv_file in sorted(samples_dir.glob("*.csv")):
+            tar.add(csv_file, arcname=csv_file.name)
+    return Response(
+        buf.getvalue(),
+        media_type="application/gzip",
+        headers={"Content-Disposition": f'attachment; filename="samples_{run_id}.tar.gz"'},
+    )
+
+
 mcp = FastMCP("stan")
 
-# ── Helpers ────────────────────────────────────────────────────────────────────
+# ── Run helpers ────────────────────────────────────────────────────────────────
+
+def _make_run_id() -> str:
+    return uuid.uuid4().hex[:12]
+
+
+def _run_base_url() -> Optional[str]:
+    """Return the HTTP sidecar base URL, or None when the port is disabled."""
+    if not _UPLOAD_PORT:
+        return None
+    host = _UPLOAD_HOST if _UPLOAD_HOST != "0.0.0.0" else "127.0.0.1"
+    return f"http://{host}:{_UPLOAD_PORT}"
+
+
+@contextlib.contextmanager
+def _capture_logs():
+    """Capture all cmdstanpy log records into a StringIO buffer."""
+    buf = io.StringIO()
+    handler = logging.StreamHandler(buf)
+    handler.setFormatter(logging.Formatter("%(levelname)-8s %(name)s: %(message)s"))
+    logger = logging.getLogger("cmdstanpy")
+    prev_level = logger.level
+    logger.addHandler(handler)
+    if prev_level == logging.NOTSET or prev_level > logging.DEBUG:
+        logger.setLevel(logging.DEBUG)
+    try:
+        yield buf
+    finally:
+        logger.removeHandler(handler)
+        logger.setLevel(prev_level)
+
+
 
 def _compute_nlpd(log_lik: np.ndarray) -> float:
     log_mean = logsumexp(log_lik, axis=0) - np.log(log_lik.shape[0])
@@ -340,7 +481,18 @@ def fit_and_evaluate(
 
     When `notes`, `rationale`, and `dataset` are all provided the result is
     appended to <results_dir>/<dataset>/log.jsonl.
+
+    Returns scalar diagnostics and NLPD inline.  Posterior draws and CmdStan
+    logs are stored server-side under a `run_id` and accessible via the
+    returned `logs_url` / `samples_url` (or `logs_file` / `samples_dir` when
+    the HTTP sidecar is disabled).  Bulk data never enters LLM context.
     """
+    # Treat empty dict/list sent by LLM tool-callers the same as None
+    if not data:
+        data = None
+    if not y_test:
+        y_test = None
+
     if data is None:
         if dataset is None:
             return {"status": "error", "stage": "input", "message": "Either 'data' (with 'y_test') or 'dataset' must be provided."}
@@ -360,20 +512,29 @@ def fit_and_evaluate(
     except Exception as exc:
         return {"status": "error", "stage": "compilation", "message": _extract_compile_error(exc)}
 
+    run_id = _make_run_id()
+    run_dir = _RESULTS_DIR / "_runs" / run_id
+    samples_dir = run_dir / "samples"
+    samples_dir.mkdir(parents=True, exist_ok=True)
+
     cfg = _merge_config(config)
     t0 = time.time()
-    try:
-        fit = model.sample(
-            data=data,
-            chains=cfg["chains"],
-            iter_warmup=cfg["iter_warmup"],
-            iter_sampling=cfg["iter_sampling"],
-            seed=cfg["seed"],
-            show_progress=False,
-            show_console=False,
-        )
-    except Exception as exc:
-        return {"status": "error", "stage": "sampling", "message": str(exc)[:500]}
+    with _capture_logs() as log_buf:
+        try:
+            fit = model.sample(
+                data=data,
+                chains=cfg["chains"],
+                iter_warmup=cfg["iter_warmup"],
+                iter_sampling=cfg["iter_sampling"],
+                seed=cfg["seed"],
+                show_progress=False,
+                show_console=False,
+                output_dir=str(samples_dir),
+            )
+        except Exception as exc:
+            (run_dir / "logs.txt").write_text(log_buf.getvalue())
+            return {"status": "error", "stage": "sampling", "message": str(exc)[:500]}
+    (run_dir / "logs.txt").write_text(log_buf.getvalue())
     runtime_sec = round(time.time() - t0, 1)
 
     all_vars = fit.stan_variables()
@@ -395,17 +556,23 @@ def fit_and_evaluate(
     except Exception:
         diag = {"n_divergences": -1, "r_hat_max": float("nan"), "ess_bulk_min": -1}
 
-    param_summary = _make_param_summary(fit)
-
     result: dict = {
         "status": "ok",
+        "run_id": run_id,
         "nlpd": round(nlpd, 4),
         "n_divergences": diag["n_divergences"],
         "r_hat_max": diag["r_hat_max"],
         "ess_bulk_min": diag["ess_bulk_min"],
         "runtime_sec": runtime_sec,
-        "param_summary": param_summary,
     }
+
+    base_url = _run_base_url()
+    if base_url:
+        result["logs_url"]    = f"{base_url}/logs/{run_id}"
+        result["samples_url"] = f"{base_url}/samples/{run_id}"
+    else:
+        result["logs_file"]   = str(run_dir / "logs.txt")
+        result["samples_dir"] = str(samples_dir)
 
     if dataset is not None and notes is not None:
         existing = _read_log(dataset)
@@ -413,6 +580,7 @@ def fit_and_evaluate(
         improved = None if iter_num == 0 else bool(nlpd < min(e["nlpd"] for e in existing if "nlpd" in e))
         _append_log(dataset, {
             "iter": iter_num,
+            "run_id": run_id,
             "nlpd": round(nlpd, 4),
             "improved": improved,
             "machine": socket.gethostname(),
@@ -434,32 +602,41 @@ def sample(
     data: dict,
     config: Optional[dict] = None,
 ) -> dict:
-    """Sample from a Stan model and return raw posterior draws.
+    """Sample from a Stan model and persist posterior draws to disk.
 
-    Draws are flattened across chains.  log_lik is omitted by default;
-    pass `return_log_lik: true` inside `config` to include it.
+    Returns scalar diagnostics and a `run_id` only — raw draws are never
+    returned inline.  Retrieve them via `samples_url` (tar.gz of per-chain
+    Stan CSVs) or `samples_dir` (local path when the HTTP sidecar is off).
+    CmdStan logs are available at `logs_url` / `logs_file`.
     """
-    return_log_lik = bool((config or {}).get("return_log_lik", False))
-
     try:
         model = _get_model(stan_code)
     except Exception as exc:
         return {"status": "error", "stage": "compilation", "message": _extract_compile_error(exc)}
 
+    run_id = _make_run_id()
+    run_dir = _RESULTS_DIR / "_runs" / run_id
+    samples_dir = run_dir / "samples"
+    samples_dir.mkdir(parents=True, exist_ok=True)
+
     cfg = _merge_config(config)
     t0 = time.time()
-    try:
-        fit = model.sample(
-            data=data,
-            chains=cfg["chains"],
-            iter_warmup=cfg["iter_warmup"],
-            iter_sampling=cfg["iter_sampling"],
-            seed=cfg["seed"],
-            show_progress=False,
-            show_console=False,
-        )
-    except Exception as exc:
-        return {"status": "error", "stage": "sampling", "message": str(exc)[:500]}
+    with _capture_logs() as log_buf:
+        try:
+            fit = model.sample(
+                data=data,
+                chains=cfg["chains"],
+                iter_warmup=cfg["iter_warmup"],
+                iter_sampling=cfg["iter_sampling"],
+                seed=cfg["seed"],
+                show_progress=False,
+                show_console=False,
+                output_dir=str(samples_dir),
+            )
+        except Exception as exc:
+            (run_dir / "logs.txt").write_text(log_buf.getvalue())
+            return {"status": "error", "stage": "sampling", "message": str(exc)[:500]}
+    (run_dir / "logs.txt").write_text(log_buf.getvalue())
     runtime_sec = round(time.time() - t0, 1)
 
     try:
@@ -467,24 +644,23 @@ def sample(
     except Exception:
         diag = {"n_divergences": -1, "r_hat_max": float("nan"), "ess_bulk_min": -1}
 
-    draws_out: dict = {}
-    for name, draws in fit.stan_variables().items():
-        if name == "log_lik" and not return_log_lik:
-            continue
-        draws = np.asarray(draws)
-        if draws.ndim == 1:
-            draws_out[name] = draws.tolist()
-        elif draws.ndim == 2:
-            for i in range(draws.shape[1]):
-                draws_out[f"{name}[{i + 1}]"] = draws[:, i].tolist()
-
-    return {
+    result: dict = {
         "status": "ok",
+        "run_id": run_id,
         "n_samples": cfg["chains"] * cfg["iter_sampling"],
         "runtime_sec": runtime_sec,
-        "draws": draws_out,
         "diagnostics": diag,
     }
+
+    base_url = _run_base_url()
+    if base_url:
+        result["logs_url"]    = f"{base_url}/logs/{run_id}"
+        result["samples_url"] = f"{base_url}/samples/{run_id}"
+    else:
+        result["logs_file"]   = str(run_dir / "logs.txt")
+        result["samples_dir"] = str(samples_dir)
+
+    return result
 
 
 # ── Tool: get_data_summary ─────────────────────────────────────────────────────
@@ -524,62 +700,41 @@ def get_data_summary(dataset: str) -> dict:
     }
 
 
-# ── Tool: upload_dataset ──────────────────────────────────────────────────────
+# ── Tool: get_upload_instructions ─────────────────────────────────────────────
 
 @mcp.tool()
-def upload_dataset(
-    name: str,
-    train_csv: str,
-    test_csv: str,
-    dataset_md: Optional[str] = None,
-) -> dict:
-    """Register a dataset on the server by uploading CSV content as strings.
+def get_upload_instructions() -> dict:
+    """Return instructions for uploading datasets directly to the server via HTTP.
 
-    Useful when the server is running remotely and files cannot be pre-staged.
-    Call this once before calling fit_and_evaluate / get_data_summary with
-    the same dataset name.  Overwrites any previously uploaded dataset with
-    the same name.
-
-    Parameters
-    ----------
-    name        : identifier used in subsequent tool calls, e.g. "my_experiment"
-    train_csv   : full CSV content (including header row) for training data
-    test_csv    : full CSV content (including header row) for held-out test data
-    dataset_md  : optional dataset.md content (e.g. with ## Data Interface block
-                  for variable-type annotations); pass None to skip
+    Datasets must be uploaded via the HTTP endpoint (POST /dataset/{name}) so
+    that CSV content — including test labels — never passes through LLM context.
+    Call this tool to get the URL and field names to pass to the user or client.
     """
-    _UPLOAD_DIR_NAME = "_uploaded"
-
-    # Validate name: alphanumeric, underscores, hyphens only — no path traversal
-    if not re.fullmatch(r'[A-Za-z0-9_\-]+', name):
+    if not _UPLOAD_PORT:
         return {
-            "status": "error",
-            "message": "Dataset name may only contain letters, digits, underscores, and hyphens.",
+            "status": "disabled",
+            "message": "The HTTP upload endpoint is disabled on this server (--upload-port 0).",
         }
-
-    ds_dir = _DATASETS_DIR / _UPLOAD_DIR_NAME / name
-    protected_dir = ds_dir / "protected"
-    protected_dir.mkdir(parents=True, exist_ok=True)
-
-    (ds_dir / "train.csv").write_text(train_csv)
-    (protected_dir / "test.csv").write_text(test_csv)
-    if dataset_md is not None:
-        (ds_dir / "dataset.md").write_text(dataset_md)
-
-    # Quick sanity check: parse headers and row counts
-    try:
-        train_cols = _load_csv_columns(ds_dir / "train.csv")
-        test_cols  = _load_csv_columns(protected_dir / "test.csv")
-    except Exception as exc:
-        return {"status": "error", "message": f"CSV parse error: {exc}"}
-
+    host_display = _UPLOAD_HOST if _UPLOAD_HOST != "0.0.0.0" else "<server-address>"
+    base_url = f"http://{host_display}:{_UPLOAD_PORT}"
     return {
         "status": "ok",
-        "dataset": f"{_UPLOAD_DIR_NAME}/{name}",
-        "n_train": len(next(iter(train_cols.values()))),
-        "n_test":  len(next(iter(test_cols.values()))),
-        "train_columns": list(train_cols.keys()),
-        "test_columns":  list(test_cols.keys()),
+        "upload_url_template": f"{base_url}/dataset/{{name}}",
+        "method": "POST",
+        "content_type": "multipart/form-data",
+        "fields": {
+            "train":      "required — CSV file (training data, must include header row)",
+            "test":       "required — CSV file (held-out test data, must include header row)",
+            "dataset_md": "optional — plain-text field with ## Data Interface block for variable annotations",
+        },
+        "example_curl": (
+            f"curl -X POST {base_url}/dataset/my_experiment "
+            "-F train=@train.csv -F test=@test.csv -F dataset_md=@dataset.md"
+        ),
+        "note": (
+            "After a successful upload the qualified dataset name is '_uploaded/<name>', "
+            "e.g. '_uploaded/my_experiment'.  Pass this to fit_and_evaluate / get_data_summary."
+        ),
     }
 
 
@@ -591,16 +746,16 @@ def list_datasets() -> dict:
 
     Returns two lists:
       - datasets : top-level pre-staged datasets under --datasets-dir
-      - uploaded : datasets pushed via upload_dataset (under _uploaded/)
+      - uploaded : datasets pushed via the HTTP upload endpoint (under _uploaded/)
     """
     top_level = sorted(
         p.parent.name
         for p in _DATASETS_DIR.glob("*/train.csv")
-        if p.parent.name != "_uploaded"
+        if p.parent.name != _UPLOAD_DIR
     )
-    uploaded_dir = _DATASETS_DIR / "_uploaded"
+    uploaded_dir = _DATASETS_DIR / _UPLOAD_DIR
     uploaded = sorted(
-        f"_uploaded/{p.parent.name}"
+        f"{_UPLOAD_DIR}/{p.parent.name}"
         for p in uploaded_dir.glob("*/train.csv")
     ) if uploaded_dir.exists() else []
     return {"datasets": top_level, "uploaded": uploaded}
@@ -637,6 +792,9 @@ def get_capabilities() -> dict:
     Call this first to understand what the server can do and how it is
     configured before issuing other tool calls.
     """
+    base_url = _run_base_url()
+    upload_url = f"{base_url}/dataset/{{name}}" if base_url else "disabled"
+    runs_base  = base_url if base_url else "disabled (local paths returned instead)"
     return {
         "server": "stan-mcp-server",
         "tools": [
@@ -646,7 +804,7 @@ def get_capabilities() -> dict:
             "check_model",
             "fit_and_evaluate",
             "sample",
-            "upload_dataset",
+            "get_upload_instructions",
             "get_run_history",
         ],
         "default_sampling_config": _DEFAULT_CONFIG,
@@ -654,9 +812,15 @@ def get_capabilities() -> dict:
             "Every model used with fit_and_evaluate must declare "
             "'vector[N_test] log_lik' in generated quantities."
         ),
+        "bulk_data_policy": (
+            "fit_and_evaluate and sample return only scalar diagnostics inline. "
+            "Posterior draws are at <samples_url> (tar.gz); logs at <logs_url>."
+        ),
         "datasets_dir": str(_DATASETS_DIR),
         "results_dir": str(_RESULTS_DIR),
         "model_cache_dir": str(_MODEL_CACHE),
+        "http_upload_url": upload_url,
+        "http_runs_base":  runs_base,
     }
 
 
@@ -675,17 +839,40 @@ def main() -> None:
         help="Path to directory where per-dataset log.jsonl files are written.",
     )
     parser.add_argument("--host", default="127.0.0.1", help="Bind host (default: 127.0.0.1)")
-    parser.add_argument("--port", default=8765, type=int, help="Bind port (default: 8765)")
+    parser.add_argument("--port", default=8765, type=int, help="MCP bind port (default: 8765)")
+    parser.add_argument(
+        "--upload-port", default=8766, type=int,
+        help="HTTP upload endpoint port (default: 8766).  Pass 0 to disable.",
+    )
     args = parser.parse_args()
 
-    global _DATASETS_DIR, _RESULTS_DIR
+    global _DATASETS_DIR, _RESULTS_DIR, _UPLOAD_PORT, _UPLOAD_HOST
     _DATASETS_DIR = args.datasets_dir.resolve()
     _RESULTS_DIR  = args.results_dir.resolve()
+    _UPLOAD_PORT  = args.upload_port
+    _UPLOAD_HOST  = args.host
 
     print(f"Stan MCP Server starting on http://{args.host}:{args.port}/mcp")
     print(f"  datasets : {_DATASETS_DIR}")
     print(f"  results  : {_RESULTS_DIR}")
     print(f"  cache    : {_MODEL_CACHE}")
+
+    if _UPLOAD_PORT:
+        upload_url = f"http://{args.host}:{_UPLOAD_PORT}/dataset/{{name}}"
+        print(f"  upload   : {upload_url}")
+        t = threading.Thread(
+            target=uvicorn.run,
+            kwargs={
+                "app": _upload_app,
+                "host": args.host,
+                "port": _UPLOAD_PORT,
+                "log_level": "error",
+            },
+            daemon=True,
+        )
+        t.start()
+    else:
+        print("  upload   : disabled")
 
     mcp.run(transport="streamable-http", host=args.host, port=args.port)
 

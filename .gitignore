@@ -23,3 +23,5 @@ datasets/
 .DS_Store
 .vscode/
 *.swp
+/stan_test_datasets
+/stan_test_results
