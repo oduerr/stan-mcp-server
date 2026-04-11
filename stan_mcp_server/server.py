@@ -479,6 +479,13 @@ def fit_and_evaluate(
     loaded automatically from <datasets_dir>/<dataset>/train.csv and
     <datasets_dir>/<dataset>/protected/test.csv.
 
+    IMPORTANT — N and N_test are never injected automatically from the CSV.
+    You must declare them in the Stan `data` block and supply their values via
+    the `data` parameter (e.g. `data={"N": 80, "N_test": 20}`).  CSV columns
+    are only loaded when a `## Data Interface` Stan block is present in
+    `dataset.md`; without it only N_train/N_test scalars reach CmdStan and
+    sampling will fail with a dimension mismatch.
+
     When `notes`, `rationale`, and `dataset` are all provided the result is
     appended to <results_dir>/<dataset>/log.jsonl.
 
@@ -671,6 +678,13 @@ def get_data_summary(dataset: str) -> dict:
 
     Reads <datasets_dir>/<dataset>/train.csv and dataset.md.
     The response column of the test set is not exposed (held-out integrity).
+
+    IMPORTANT — N and N_test are not injected automatically into Stan data.
+    After reviewing this summary, declare them in the Stan `data` block and
+    supply their values via the `data` parameter of `fit_and_evaluate`
+    (e.g. `data={"N": n_train, "N_test": n_test}`).
+    Also check that `dataset_md` contains a `## Data Interface` Stan block;
+    without it no CSV columns will be loaded during sampling.
     """
     ds_dir     = _DATASETS_DIR / dataset
     train_path = ds_dir / "train.csv"
@@ -709,6 +723,16 @@ def get_upload_instructions() -> dict:
     Datasets must be uploaded via the HTTP endpoint (POST /dataset/{name}) so
     that CSV content — including test labels — never passes through LLM context.
     Call this tool to get the URL and field names to pass to the user or client.
+
+    After uploading, the `dataset_md` field (or a separate `dataset.md` file)
+    MUST contain a `## Data Interface` Stan block declaring the `_train`
+    variables (e.g. `vector[N_train] x_train;`).  Without this block no CSV
+    columns will be loaded and sampling will silently use an empty data dict.
+
+    IMPORTANT — N and N_test are never injected automatically from the CSV.
+    Declare them in the Stan `data` block and supply their values explicitly
+    via the `data` parameter of `fit_and_evaluate`
+    (e.g. `data={"N": 80, "N_test": 20}`).
     """
     if not _UPLOAD_PORT:
         return {
