@@ -1,3 +1,5 @@
+# PLEASE NOTE THIS IS WORK IN PROGRESS NOT READY FOR USE yet! JUST A PRIVATE PROOF OF CONCEPT FOR NOW NEEDED TO MAKE PUBLIC REPO DUE TO EASE.
+
 # Stan MCP Server
 
 A standalone MCP server that gives an LLM agent structured access to
