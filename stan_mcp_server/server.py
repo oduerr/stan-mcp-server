@@ -48,9 +48,9 @@ from fastapi import FastAPI, File, Form, HTTPException, Response, UploadFile
 from fastapi.responses import PlainTextResponse
 from fastmcp import FastMCP
 from scipy.special import logsumexp
-from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.requests import Request
 from starlette.responses import Response as StarletteResponse
+from starlette.types import ASGIApp, Receive, Scope, Send
 
 # ── Global path config (set by main() before the server starts) ────────────────
 _DATASETS_DIR:  Path = Path("datasets")
@@ -62,14 +62,21 @@ _UPLOAD_DIR:    str  = "_uploaded"
 _BEARER_TOKEN:  Optional[str] = None  # set by --token; None = no auth
 
 
-class _BearerTokenMiddleware(BaseHTTPMiddleware):
-    """Reject requests that don't carry the correct Bearer token."""
+class _BearerTokenMiddleware:
+    """ASGI middleware — reject requests without the correct Bearer token."""
 
-    async def dispatch(self, request: Request, call_next):
-        auth = request.headers.get("Authorization", "")
-        if auth != f"Bearer {_BEARER_TOKEN}":
-            return StarletteResponse("Unauthorized", status_code=401)
-        return await call_next(request)
+    def __init__(self, app: ASGIApp) -> None:
+        self.app = app
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        if scope["type"] == "http":
+            headers = dict(scope.get("headers", []))
+            auth = headers.get(b"authorization", b"").decode()
+            if auth != f"Bearer {_BEARER_TOKEN}":
+                response = StarletteResponse("Unauthorized", status_code=401)
+                await response(scope, receive, send)
+                return
+        await self.app(scope, receive, send)
 
 # ── Default sampling config ────────────────────────────────────────────────────
 _DEFAULT_CONFIG = {
