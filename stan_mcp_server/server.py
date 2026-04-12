@@ -48,6 +48,7 @@ from fastapi import FastAPI, File, Form, HTTPException, Response, UploadFile
 from fastapi.responses import PlainTextResponse
 from fastmcp import FastMCP
 from scipy.special import logsumexp
+from starlette.middleware import Middleware
 from starlette.requests import Request
 from starlette.responses import Response as StarletteResponse
 from starlette.types import ASGIApp, Receive, Scope, Send
@@ -908,19 +909,19 @@ def main() -> None:
     _UPLOAD_HOST   = args.host
     _BEARER_TOKEN  = args.token or os.environ.get("STAN_MCP_TOKEN")
 
-    if _BEARER_TOKEN:
-        mcp.add_middleware(_BearerTokenMiddleware)
-        _upload_app.add_middleware(_BearerTokenMiddleware)
-
     print(f"Stan MCP Server starting on http://{args.host}:{args.port}/mcp")
     print(f"  datasets : {_DATASETS_DIR}")
     print(f"  results  : {_RESULTS_DIR}")
     print(f"  cache    : {_MODEL_CACHE}")
     print(f"  auth     : {'Bearer token required' if _BEARER_TOKEN else 'none (use --token to enable)'}")
 
+    token_middleware = [Middleware(_BearerTokenMiddleware)] if _BEARER_TOKEN else []
+
     if _UPLOAD_PORT:
         upload_url = f"http://{args.host}:{_UPLOAD_PORT}/dataset/{{name}}"
         print(f"  upload   : {upload_url}")
+        if _BEARER_TOKEN:
+            _upload_app.add_middleware(_BearerTokenMiddleware)
         t = threading.Thread(
             target=uvicorn.run,
             kwargs={
@@ -935,7 +936,8 @@ def main() -> None:
     else:
         print("  upload   : disabled")
 
-    mcp.run(transport="streamable-http", host=args.host, port=args.port)
+    mcp.run(transport="streamable-http", host=args.host, port=args.port,
+            middleware=token_middleware)
 
 
 if __name__ == "__main__":
