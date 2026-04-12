@@ -900,6 +900,11 @@ def main() -> None:
             "Generate one with: openssl rand -hex 32"
         ),
     )
+    parser.add_argument(
+        "--transport", default="streamable-http",
+        choices=["streamable-http", "stdio"],
+        help="MCP transport (default: streamable-http).  Use 'stdio' for Claude Desktop via SSH.",
+    )
     args = parser.parse_args()
 
     global _DATASETS_DIR, _RESULTS_DIR, _UPLOAD_PORT, _UPLOAD_HOST, _BEARER_TOKEN
@@ -908,6 +913,12 @@ def main() -> None:
     _UPLOAD_PORT   = args.upload_port
     _UPLOAD_HOST   = args.host
     _BEARER_TOKEN  = args.token or os.environ.get("STAN_MCP_TOKEN")
+
+    if args.transport == "stdio":
+        import sys
+        print(f"Stan MCP Server (stdio) — datasets: {_DATASETS_DIR}  results: {_RESULTS_DIR}", file=sys.stderr)
+        mcp.run(transport="stdio")
+        return
 
     print(f"Stan MCP Server starting on http://{args.host}:{args.port}/mcp")
     print(f"  datasets : {_DATASETS_DIR}")
