@@ -242,33 +242,65 @@ SHA-256 of the model source.  Identical model code is never recompiled.
 
 ## Security
 
-For remote deployments add bearer-token middleware before starting the
-server (auth is intentionally left out of the core to keep the server
-simple for local use):
+For remote deployments (i.e. `--host 0.0.0.0`) protect the server with a
+bearer token using the built-in `--token` flag.
 
-```python
-from starlette.middleware.base import BaseHTTPMiddleware
-from starlette.responses import Response
-import os
+### 1. Generate a token
 
-class TokenAuth(BaseHTTPMiddleware):
-    async def dispatch(self, request, call_next):
-        if request.headers.get("Authorization") != f"Bearer {os.environ['MCP_API_TOKEN']}":
-            return Response("Unauthorized", status_code=401)
-        return await call_next(request)
-
-mcp.add_middleware(TokenAuth)
+```bash
+openssl rand -hex 32
+# e.g. a3f8c2d1e4b5...
 ```
 
-Pass the token from the client via `headers`:
+### 2. Start the server with the token
+
+```bash
+stan-mcp-server \
+  --host 0.0.0.0 \
+  --datasets-dir /path/to/datasets \
+  --results-dir  /path/to/results \
+  --token a3f8c2d1e4b5...
+```
+
+Alternatively, set the environment variable `STAN_MCP_TOKEN` instead of
+passing `--token` on the command line (useful for keeping secrets out of
+shell history):
+
+```bash
+export STAN_MCP_TOKEN=a3f8c2d1e4b5...
+stan-mcp-server --host 0.0.0.0 --datasets-dir ... --results-dir ...
+```
+
+Both the MCP endpoint (port 8765) and the HTTP upload endpoint (port 8766)
+require the token.  Requests without a valid `Authorization: Bearer <token>`
+header receive `401 Unauthorized`.
+
+### 3. Connect from Claude Desktop
 
 ```json
 {
   "mcpServers": {
     "stan": {
-      "url": "http://remotehost:8765/mcp",
-      "headers": { "Authorization": "Bearer <token>" }
+      "url": "http://<server-ip>:8765/mcp",
+      "headers": { "Authorization": "Bearer a3f8c2d1e4b5..." }
     }
   }
 }
+```
+
+### 4. Upload datasets with the token
+
+```bash
+curl -X POST http://<server-ip>:8766/dataset/my_experiment \
+     -H "Authorization: Bearer a3f8c2d1e4b5..." \
+     -F train=@train.csv \
+     -F test=@test.csv
+```
+
+### 5. Download results with the token
+
+```bash
+curl http://<server-ip>:8766/samples/<run_id> \
+     -H "Authorization: Bearer a3f8c2d1e4b5..." \
+     -o samples.tar.gz
 ```

@@ -31,6 +31,7 @@ import hashlib
 import io
 import json
 import logging
+import os
 import re
 import socket
 import tarfile
@@ -47,6 +48,9 @@ from fastapi import FastAPI, File, Form, HTTPException, Response, UploadFile
 from fastapi.responses import PlainTextResponse
 from fastmcp import FastMCP
 from scipy.special import logsumexp
+from starlette.middleware.base import BaseHTTPMiddleware
+from starlette.requests import Request
+from starlette.responses import Response as StarletteResponse
 
 # ── Global path config (set by main() before the server starts) ────────────────
 _DATASETS_DIR:  Path = Path("datasets")
@@ -55,6 +59,17 @@ _MODEL_CACHE:   Path = Path(tempfile.gettempdir()) / "stan_mcp_model_cache"
 _UPLOAD_PORT:   int  = 8766          # 0 = disabled
 _UPLOAD_HOST:   str  = "127.0.0.1"
 _UPLOAD_DIR:    str  = "_uploaded"
+_BEARER_TOKEN:  Optional[str] = None  # set by --token; None = no auth
+
+
+class _BearerTokenMiddleware(BaseHTTPMiddleware):
+    """Reject requests that don't carry the correct Bearer token."""
+
+    async def dispatch(self, request: Request, call_next):
+        auth = request.headers.get("Authorization", "")
+        if auth != f"Bearer {_BEARER_TOKEN}":
+            return StarletteResponse("Unauthorized", status_code=401)
+        return await call_next(request)
 
 # ── Default sampling config ────────────────────────────────────────────────────
 _DEFAULT_CONFIG = {
@@ -868,18 +883,33 @@ def main() -> None:
         "--upload-port", default=8766, type=int,
         help="HTTP upload endpoint port (default: 8766).  Pass 0 to disable.",
     )
+    parser.add_argument(
+        "--token", default=None,
+        help=(
+            "Bearer token for authentication.  If set, all requests to both "
+            "the MCP endpoint and the HTTP upload endpoint must include "
+            "'Authorization: Bearer <token>'.  "
+            "Generate one with: openssl rand -hex 32"
+        ),
+    )
     args = parser.parse_args()
 
-    global _DATASETS_DIR, _RESULTS_DIR, _UPLOAD_PORT, _UPLOAD_HOST
-    _DATASETS_DIR = args.datasets_dir.resolve()
-    _RESULTS_DIR  = args.results_dir.resolve()
-    _UPLOAD_PORT  = args.upload_port
-    _UPLOAD_HOST  = args.host
+    global _DATASETS_DIR, _RESULTS_DIR, _UPLOAD_PORT, _UPLOAD_HOST, _BEARER_TOKEN
+    _DATASETS_DIR  = args.datasets_dir.resolve()
+    _RESULTS_DIR   = args.results_dir.resolve()
+    _UPLOAD_PORT   = args.upload_port
+    _UPLOAD_HOST   = args.host
+    _BEARER_TOKEN  = args.token or os.environ.get("STAN_MCP_TOKEN")
+
+    if _BEARER_TOKEN:
+        mcp.add_middleware(_BearerTokenMiddleware)
+        _upload_app.add_middleware(_BearerTokenMiddleware)
 
     print(f"Stan MCP Server starting on http://{args.host}:{args.port}/mcp")
     print(f"  datasets : {_DATASETS_DIR}")
     print(f"  results  : {_RESULTS_DIR}")
     print(f"  cache    : {_MODEL_CACHE}")
+    print(f"  auth     : {'Bearer token required' if _BEARER_TOKEN else 'none (use --token to enable)'}")
 
     if _UPLOAD_PORT:
         upload_url = f"http://{args.host}:{_UPLOAD_PORT}/dataset/{{name}}"
