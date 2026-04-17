@@ -70,8 +70,8 @@ Stan MCP Server starting on http://127.0.0.1:8765/mcp
 | `list_datasets` | List pre-staged and uploaded datasets |
 | `get_data_summary` | Compact EDA for a named dataset |
 | `check_model` | Compile-only check (syntax + `log_lik` presence) |
-| `fit_and_evaluate` | Sample + compute NLPD; returns scalar diagnostics + run asset URLs |
-| `sample` | Sample; returns scalar diagnostics + run asset URLs |
+| `fit_and_evaluate` | Sample + compute NLPD; returns scalar diagnostics + run asset paths |
+| `sample` | Sample; returns scalar diagnostics + run asset paths |
 | `get_upload_instructions` | Return HTTP upload URL and field names for datasets |
 | `get_run_history` | Return the logged NLPD history for a dataset |
 
@@ -96,40 +96,30 @@ For a remote server, add a bearer token (see **Security** below).
 
 ## Run assets — logs and posterior draws
 
-Every `sample` and `fit_and_evaluate` call persists results server-side under
-a short `run_id` and returns only scalar diagnostics plus two URLs.  Bulk data
+Every `sample` and `fit_and_evaluate` call persists results under a short
+`run_id` and returns only scalar diagnostics plus filesystem paths.  Bulk data
 **never enters LLM context**.
 
 ```json
 {
-  "run_id":      "3a7f9c1e20b4",
-  "nlpd":        1.423,
-  "r_hat_max":   1.003,
+  "run_id":        "3a7f9c1e20b4",
+  "nlpd":          1.423,
+  "r_hat_max":     1.003,
   "n_divergences": 0,
-  "ess_bulk_min": 2841,
-  "runtime_sec": 4.2,
-  "logs_url":    "http://127.0.0.1:8766/logs/3a7f9c1e20b4",
-  "samples_url": "http://127.0.0.1:8766/samples/3a7f9c1e20b4"
+  "ess_bulk_min":  2841,
+  "runtime_sec":   4.2,
+  "logs_path":     "/path/to/results/_runs/3a7f9c1e20b4/logs.txt",
+  "samples_path":  "/path/to/results/_runs/3a7f9c1e20b4"
 }
 ```
 
-| Endpoint | Returns |
-|---|---|
-| `GET /logs/{run_id}` | CmdStan stdout/stderr as plain text |
-| `GET /samples/{run_id}` | Per-chain Stan CSV files as a `.tar.gz` |
-
-Download samples:
-
-```bash
-curl http://127.0.0.1:8766/samples/3a7f9c1e20b4 -o samples.tar.gz
-tar xf samples.tar.gz          # expands to per-chain *.csv
-```
-
-Load in Python (requires `cmdstanpy` or `arviz`):
+`samples_path` is a directory containing one Stan CSV per chain.  Load them
+directly (requires `arviz`):
 
 ```python
-import arviz as az
-idata = az.from_cmdstan(["model-1.csv", "model-2.csv", "model-3.csv", "model-4.csv"])
+import glob, arviz as az
+csvs = sorted(glob.glob("/path/to/results/_runs/3a7f9c1e20b4/samples/*.csv"))
+idata = az.from_cmdstan(csvs)
 ```
 
 Run assets are stored under `<results-dir>/_runs/<run_id>/` and are never
@@ -240,6 +230,58 @@ generated quantities {
 Compiled Stan binaries are stored in a temp directory keyed by the
 SHA-256 of the model source.  Identical model code is never recompiled.
 
+## Remote deployment
+
+The recommended pattern for running the server on a remote machine (e.g. a
+GPU workstation or cloud VM accessible via VPN):
+
+### 1. Start the server on the remote machine
+
+```bash
+stan-mcp-server \
+  --host 127.0.0.1 \           # keep MCP port local; SSH tunnel handles access
+  --datasets-dir /data/datasets \
+  --results-dir  /data/results \
+  --token $(openssl rand -hex 32)   # save this token
+```
+
+### 2. Tunnel the MCP port via SSH
+
+```bash
+ssh -N -L 8765:127.0.0.1:8765 user@remote-host
+```
+
+The MCP endpoint is now reachable at `http://127.0.0.1:8765/mcp` on your
+local machine.
+
+### 3. Mount the results directory via SSHFS
+
+```bash
+mkdir -p ~/mnt/stan-results
+sshfs user@remote-host:/data/results ~/mnt/stan-results
+```
+
+Because tool responses return `logs_path` / `samples_path` as absolute paths
+under `--results-dir`, and the mount makes those paths locally accessible,
+the agent can read logs and samples directly — no HTTP download needed.
+
+### 4. Connect from Claude Desktop
+
+```json
+{
+  "mcpServers": {
+    "stan": {
+      "url": "http://127.0.0.1:8765/mcp",
+      "headers": { "Authorization": "Bearer <your-token>" }
+    }
+  }
+}
+```
+
+> **Note:** The HTTP download endpoints (`GET /logs/{run_id}`,
+> `GET /samples/{run_id}`) remain in the codebase for future use with a
+> public URL (e.g. via Tailscale) but are not referenced in tool responses.
+
 ## Security
 
 For remote deployments (i.e. `--host 0.0.0.0`) protect the server with a
@@ -297,10 +339,3 @@ curl -X POST http://<server-ip>:8766/dataset/my_experiment \
      -F test=@test.csv
 ```
 
-### 5. Download results with the token
-
-```bash
-curl http://<server-ip>:8766/samples/<run_id> \
-     -H "Authorization: Bearer a3f8c2d1e4b5..." \
-     -o samples.tar.gz
-```
