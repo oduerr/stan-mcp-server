@@ -5,7 +5,7 @@ description = "Standalone CmdStan MCP Server — structured Bayesian modelling t
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
-    "fastmcp>=2.0",
+    "fastmcp[apps]>=2.0",
     "fastapi>=0.100",
     "uvicorn>=0.23",
     "python-multipart>=0.0.9",

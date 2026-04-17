@@ -513,9 +513,10 @@ def fit_and_evaluate(
     appended to <results_dir>/<dataset>/log.jsonl.
 
     Returns scalar diagnostics and NLPD inline.  Posterior draws and CmdStan
-    logs are stored server-side under a `run_id` and accessible via the
-    returned `logs_url` / `samples_url` (or `logs_file` / `samples_dir` when
-    the HTTP sidecar is disabled).  Bulk data never enters LLM context.
+    logs are stored under a `run_id` and their filesystem paths are returned
+    as `logs_path` / `samples_path`.  When --results-dir is mounted via SSHFS
+    on the client these paths are directly accessible.  Bulk data never enters
+    LLM context.
     """
     # Treat empty dict/list sent by LLM tool-callers the same as None
     if not data:
@@ -594,15 +595,13 @@ def fit_and_evaluate(
         "r_hat_max": diag["r_hat_max"],
         "ess_bulk_min": diag["ess_bulk_min"],
         "runtime_sec": runtime_sec,
+        # Filesystem paths — accessible directly when --results-dir is mounted
+        # via SSHFS on the client. HTTP download endpoints (/logs/{run_id},
+        # /samples/{run_id}) are reserved for future --public-base-url /
+        # Tailscale support and are not referenced here.
+        "logs_path":    str(run_dir / "logs.txt"),
+        "samples_path": str(run_dir),
     }
-
-    base_url = _run_base_url()
-    if base_url:
-        result["logs_url"]    = f"{base_url}/logs/{run_id}"
-        result["samples_url"] = f"{base_url}/samples/{run_id}"
-    else:
-        result["logs_file"]   = str(run_dir / "logs.txt")
-        result["samples_dir"] = str(samples_dir)
 
     if dataset is not None and notes is not None:
         existing = _read_log(dataset)
@@ -635,9 +634,10 @@ def sample(
     """Sample from a Stan model and persist posterior draws to disk.
 
     Returns scalar diagnostics and a `run_id` only — raw draws are never
-    returned inline.  Retrieve them via `samples_url` (tar.gz of per-chain
-    Stan CSVs) or `samples_dir` (local path when the HTTP sidecar is off).
-    CmdStan logs are available at `logs_url` / `logs_file`.
+    returned inline.  Retrieve them via `samples_path` (directory of per-chain
+    Stan CSVs).  CmdStan logs are available at `logs_path`.  Both paths are
+    under --results-dir and are directly accessible when that directory is
+    mounted via SSHFS on the client.
     """
     try:
         model = _get_model(stan_code)
@@ -680,15 +680,13 @@ def sample(
         "n_samples": cfg["chains"] * cfg["iter_sampling"],
         "runtime_sec": runtime_sec,
         "diagnostics": diag,
+        # Filesystem paths — accessible directly when --results-dir is mounted
+        # via SSHFS on the client. HTTP download endpoints (/logs/{run_id},
+        # /samples/{run_id}) are reserved for future --public-base-url /
+        # Tailscale support and are not referenced here.
+        "logs_path":    str(run_dir / "logs.txt"),
+        "samples_path": str(run_dir),
     }
-
-    base_url = _run_base_url()
-    if base_url:
-        result["logs_url"]    = f"{base_url}/logs/{run_id}"
-        result["samples_url"] = f"{base_url}/samples/{run_id}"
-    else:
-        result["logs_file"]   = str(run_dir / "logs.txt")
-        result["samples_dir"] = str(samples_dir)
 
     return result
 
@@ -841,7 +839,6 @@ def get_capabilities() -> dict:
     """
     base_url = _run_base_url()
     upload_url = f"{base_url}/dataset/{{name}}" if base_url else "disabled"
-    runs_base  = base_url if base_url else "disabled (local paths returned instead)"
     return {
         "server": "stan-mcp-server",
         "tools": [
@@ -861,13 +858,13 @@ def get_capabilities() -> dict:
         ),
         "bulk_data_policy": (
             "fit_and_evaluate and sample return only scalar diagnostics inline. "
-            "Posterior draws are at <samples_url> (tar.gz); logs at <logs_url>."
+            "Posterior draws are at <samples_path>; logs at <logs_path>. "
+            "Both paths are under results_dir and accessible via SSHFS mount."
         ),
         "datasets_dir": str(_DATASETS_DIR),
         "results_dir": str(_RESULTS_DIR),
         "model_cache_dir": str(_MODEL_CACHE),
         "http_upload_url": upload_url,
-        "http_runs_base":  runs_base,
     }
 
 
