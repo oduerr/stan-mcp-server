@@ -582,6 +582,7 @@ def fit_and_evaluate(
     run_dir = _RESULTS_DIR / "_runs" / run_id
     samples_dir = run_dir / "samples"
     samples_dir.mkdir(parents=True, exist_ok=True)
+    (run_dir / "model.stan").write_text(stan_code)
 
     cfg = _merge_config(config)
     t0 = time.time()
@@ -686,6 +687,7 @@ def sample(
     run_dir = _RESULTS_DIR / "_runs" / run_id
     samples_dir = run_dir / "samples"
     samples_dir.mkdir(parents=True, exist_ok=True)
+    (run_dir / "model.stan").write_text(stan_code)
 
     cfg = _merge_config(config)
     t0 = time.time()
