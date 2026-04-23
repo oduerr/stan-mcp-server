@@ -24,4 +24,4 @@ datasets/
 .vscode/
 *.swp
 /stan_test_datasets
-/stan_test_results
+/results

@@ -18,12 +18,12 @@ python -c "import cmdstanpy; cmdstanpy.install_cmdstan()"
 
 # 3. Start the server
 stan-mcp-server \
-  --datasets-dir /path/to/datasets \
-  --results-dir  /path/to/results
+  --datasets-dir datasets \
+  --results-dir  results
 ```
 
 The MCP server listens at `http://127.0.0.1:8765/mcp` and the HTTP upload
-endpoint at `http://127.0.0.1:8766/dataset/{name}` by default.
+endpoint is at `http://127.0.0.1:8766/dataset/{name}` by default.
 
 ## Prerequisites
 
@@ -52,15 +52,14 @@ stan-mcp-server \
   --upload-port 8766     # HTTP upload endpoint (default; 0 to disable)
 ```
 
-Startup output:
+This is could also be started with (after activating the `uv` with `source .venv/bin/activate`
 
 ```
-Stan MCP Server starting on http://127.0.0.1:8765/mcp
-  datasets : /path/to/datasets
-  results  : /path/to/results
-  cache    : /tmp/stan_mcp_model_cache
-  upload   : http://127.0.0.1:8766/dataset/{name}
+python stan_mcp_server/server.py \
+  --datasets-dir datasets \
+  --results-dir results
 ```
+
 
 ## Tools
 
@@ -68,31 +67,17 @@ Stan MCP Server starting on http://127.0.0.1:8765/mcp
 |------|---------|
 | `get_capabilities` | Query available tools, server configuration, and upload URL |
 | `list_datasets` | List pre-staged and uploaded datasets |
-| `get_data_summary` | Compact EDA for a named dataset |
+| `get_data_summary` | Compact EDA for a named dataset (includes `tier` and `has_test`) |
 | `check_model` | Compile-only check (syntax + `log_lik` presence) |
-| `fit_and_evaluate` | Sample + compute NLPD; returns scalar diagnostics + run asset paths |
+| `fit_and_evaluate` | Sample + compute NLPD on held-out test; pre-staged datasets only |
 | `sample` | Sample; returns scalar diagnostics + run asset paths |
 | `get_upload_instructions` | Return HTTP upload URL and field names for datasets |
 | `get_run_history` | Return the logged NLPD history for a dataset |
 
-**Recommended call order for an AutoStan loop:**
-`get_capabilities` → `list_datasets` → `get_data_summary` → `check_model` → `fit_and_evaluate` → `get_run_history`
-
-## Connecting from Claude desktop
-
-Add to `~/Library/Application Support/Claude/claude_desktop_config.json`:
-
-```json
-{
-  "mcpServers": {
-    "stan": {
-      "url": "http://127.0.0.1:8765/mcp"
-    }
-  }
-}
-```
-
-For a remote server, add a bearer token (see **Security** below).
+**Recommended call order:**
+`get_capabilities` → `list_datasets` → `get_data_summary` → `check_model` →
+- **Pre-staged dataset** (`tier: staged`): `fit_and_evaluate` → `get_run_history`
+- **Uploaded dataset** (`tier: uploaded`): `sample` → compute PSIS-LOO yourself
 
 ## Run assets — logs and posterior draws
 
@@ -127,17 +112,29 @@ automatically deleted.
 
 ## Uploading datasets at runtime
 
-Datasets must be uploaded via the HTTP endpoint so that CSV content —
-including **test labels** — never passes through LLM context.  The LLM calls
-`get_upload_instructions()` to retrieve the URL and field names, then passes
-them to the user or an automated client.
+The HTTP upload endpoint accepts **training data only**.  Test data must be
+placed manually by the server operator — it never passes through the agent or
+HTTP layer.  This is a deliberate security boundary: the agent cannot see
+held-out labels even in principle.
+
+The LLM calls `get_upload_instructions()` to retrieve the URL and field names,
+then passes them to the user or an automated client.
+
+### Two-tier dataset system
+
+| Tier | How created | `fit_and_evaluate` | Suggested evaluation |
+|------|-------------|---------------------|----------------------|
+| **staged** | Server operator places `train.csv` + `protected/test.csv` | ✅ real held-out NLPD | `fit_and_evaluate` |
+| **uploaded** | Agent/user uploads via HTTP (train only) | ❌ blocked | `sample` + PSIS-LOO |
+
+`get_data_summary` returns `tier` and `has_test` so the agent knows which
+path to follow before writing any Stan code.
 
 ### HTTP upload endpoint
 
 ```bash
 curl -X POST http://127.0.0.1:8766/dataset/my_experiment \
      -F train=@train.csv \
-     -F test=@test.csv \
      -F dataset_md=@dataset.md   # optional
 ```
 
@@ -146,17 +143,18 @@ Or from Python:
 ```python
 import requests
 
-with open("train.csv") as tr, open("test.csv") as te:
+with open("train.csv") as tr:
     r = requests.post(
         "http://127.0.0.1:8766/dataset/my_experiment",
-        files={"train": tr, "test": te},
+        files={"train": tr},
     )
 r.raise_for_status()
-print(r.json())   # {"status": "ok", "dataset": "_uploaded/my_experiment", ...}
+print(r.json())   # {"status": "ok", "tier": "uploaded", "dataset": "_uploaded/my_experiment", ...}
 ```
 
-After a successful upload pass `_uploaded/my_experiment` to
-`fit_and_evaluate` / `get_data_summary`.
+After a successful upload pass `_uploaded/my_experiment` to `sample` /
+`get_data_summary`.  To enable `fit_and_evaluate`, place test data at
+`<datasets_dir>/_uploaded/my_experiment/protected/test.csv` manually.
 
 To disable the HTTP endpoint entirely:
 
@@ -169,23 +167,39 @@ Dataset names may only contain letters, digits, underscores, and hyphens.
 
 ## Dataset layout
 
-Each dataset lives in its own subdirectory under `--datasets-dir`:
+Datasets live under `--datasets-dir` in two areas:
 
 ```
 datasets/
-  my_dataset/
-    train.csv               ← training features + response
-    dataset.md              ← description + ## Data Interface block
-    protected/
-      test.csv              ← held-out test features + response
+  benchmarks/             ← pre-staged benchmark datasets (operator-managed)
+    regression_1d/
+      train.csv           ← training features + response
+      dataset.md          ← description + ## Data Interface block
+      protected/
+        test.csv          ← held-out test features + response (operator-placed)
+  _uploaded/              ← agent-uploaded, train-only datasets
+    my_experiment/
+      train.csv
+      dataset.md          ← optional
 ```
+
+The dataset name passed to tools is the path relative to `--datasets-dir`,
+e.g. `benchmarks/regression_1d` or `_uploaded/my_experiment`.
+
+The `protected/test.csv` file is what makes a dataset "staged" and enables
+`fit_and_evaluate`.  Uploaded datasets lack this file and are limited to
+`sample` + PSIS-LOO.
 
 The LLM only needs to pass the dataset name — the server loads data
 automatically:
 
 ```python
-fit_and_evaluate(stan_code=..., dataset="my_dataset", notes="...", rationale="...")
+fit_and_evaluate(stan_code=..., dataset="benchmarks/regression_1d", notes="...", rationale="...")
 ```
+
+`N_train` and `N_test` are injected automatically from the CSV row counts.
+Only pass the `data` parameter when you need to override them or supply
+additional scalars the CSV does not provide.
 
 ### dataset.md convention
 
@@ -263,7 +277,7 @@ sshfs user@remote-host:/data/results ~/mnt/stan-results
 
 Because tool responses return `logs_path` / `samples_path` as absolute paths
 under `--results-dir`, and the mount makes those paths locally accessible,
-the agent can read logs and samples directly — no HTTP download needed.
+the agent can read logs and samples directly.
 
 ### 4. Connect from Claude Desktop
 
@@ -278,9 +292,9 @@ the agent can read logs and samples directly — no HTTP download needed.
 }
 ```
 
-> **Note:** The HTTP download endpoints (`GET /logs/{run_id}`,
-> `GET /samples/{run_id}`) remain in the codebase for future use with a
-> public URL (e.g. via Tailscale) but are not referenced in tool responses.
+> **Note:** The HTTP download endpoints (`GET /logs/{run_id}`, `GET /samples/{run_id}`)
+> have been removed. Access run assets directly via the SSHFS-mounted `results_dir`
+> using the `logs_path` / `samples_path` returned in tool responses.
 
 ## Security
 
@@ -335,7 +349,6 @@ header receive `401 Unauthorized`.
 ```bash
 curl -X POST http://<server-ip>:8766/dataset/my_experiment \
      -H "Authorization: Bearer a3f8c2d1e4b5..." \
-     -F train=@train.csv \
-     -F test=@test.csv
+     -F train=@train.csv
 ```
 

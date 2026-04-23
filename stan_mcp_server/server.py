@@ -22,6 +22,16 @@ Usage
 -----
     stan-mcp-server --datasets-dir /path/to/datasets --results-dir /path/to/results
     stan-mcp-server --datasets-dir ./datasets --results-dir ./results --port 8765 --host 0.0.0.0
+
+Expected datasets layout:
+    datasets/
+      benchmarks/          ← pre-staged benchmark datasets (have protected/test.csv)
+        regression_1d/
+          train.csv
+          dataset.md
+          protected/
+            test.csv
+      _uploaded/           ← agent-uploaded, train-only datasets
 """
 
 import argparse
@@ -34,7 +44,6 @@ import logging
 import os
 import re
 import socket
-import tarfile
 import tempfile
 import threading
 import time
@@ -44,8 +53,7 @@ from typing import Optional
 
 import numpy as np
 import uvicorn
-from fastapi import FastAPI, File, Form, HTTPException, Response, UploadFile
-from fastapi.responses import PlainTextResponse
+from fastapi import FastAPI, File, HTTPException, UploadFile
 from fastmcp import FastMCP
 from scipy.special import logsumexp
 from starlette.middleware import Middleware
@@ -92,39 +100,60 @@ _DEFAULT_CONFIG = {
 def _save_dataset(
     name: str,
     train_csv: str,
-    test_csv: str,
     dataset_md: Optional[str] = None,
 ) -> dict:
-    """Validate name, write files, sanity-check CSVs.  Returns a status dict."""
+    """Validate name, write train CSV and optional dataset.md.  Returns a status dict.
+
+    Test data is intentionally NOT accepted here — it must be placed manually
+    in <datasets_dir>/<name>/protected/test.csv by the server operator.  This
+    ensures that held-out labels never pass through LLM context.
+    """
     if not re.fullmatch(r'[A-Za-z0-9_\-]+', name):
         return {
             "status": "error",
             "message": "Dataset name may only contain letters, digits, underscores, and hyphens.",
         }
 
-    ds_dir        = _DATASETS_DIR / _UPLOAD_DIR / name
-    protected_dir = ds_dir / "protected"
-    protected_dir.mkdir(parents=True, exist_ok=True)
+    ds_dir = _DATASETS_DIR / _UPLOAD_DIR / name
+    ds_dir.mkdir(parents=True, exist_ok=True)
 
     (ds_dir / "train.csv").write_text(train_csv)
-    (protected_dir / "test.csv").write_text(test_csv)
     if dataset_md is not None:
         (ds_dir / "dataset.md").write_text(dataset_md)
 
     try:
         train_cols = _load_csv_columns(ds_dir / "train.csv")
-        test_cols  = _load_csv_columns(protected_dir / "test.csv")
     except Exception as exc:
         return {"status": "error", "message": f"CSV parse error: {exc}"}
 
-    return {
+    # Validate Data Interface block against train.csv columns (fast-fail at upload).
+    interface_warnings: list[str] = []
+    if dataset_md is not None:
+        interface = _parse_data_interface(dataset_md)
+        train_col_set = set(train_cols.keys())
+        for base in interface["train_vars"]:
+            if base not in train_col_set and f"{base}_train" not in train_col_set:
+                interface_warnings.append(
+                    f"Data Interface declares '{base}_train' but column '{base}' "
+                    f"(or '{base}_train') not found in train.csv. "
+                    f"train.csv columns: {sorted(train_col_set)}"
+                )
+
+    result = {
         "status": "ok",
         "dataset": f"{_UPLOAD_DIR}/{name}",
+        "tier": "uploaded",
         "n_train": len(next(iter(train_cols.values()))),
-        "n_test":  len(next(iter(test_cols.values()))),
         "train_columns": list(train_cols.keys()),
-        "test_columns":  list(test_cols.keys()),
+        "note": (
+            "Uploaded datasets have no held-out test set. "
+            "Use the 'sample' tool and compute PSIS-LOO on the training log_lik yourself. "
+            "fit_and_evaluate requires a pre-staged dataset with protected/test.csv."
+        ),
     }
+    if interface_warnings:
+        result["interface_warnings"] = interface_warnings
+    return result
 
 
 # ── HTTP upload app (runs on --upload-port in a daemon thread) ─────────────────
@@ -136,47 +165,17 @@ _upload_app = FastAPI(title="Stan dataset upload", docs_url=None, redoc_url=None
 async def _http_upload_dataset(
     name: str,
     train: UploadFile = File(..., description="Training CSV (including header row)"),
-    test:  UploadFile = File(..., description="Held-out test CSV (including header row)"),
-    dataset_md: Optional[str] = Form(None, description="Optional dataset.md content"),
+    dataset_md: Optional[UploadFile] = File(None, description="Optional dataset.md file"),
 ) -> dict:
-    """Upload train/test CSVs for a dataset via multipart POST.
+    """Upload a training CSV (and optional dataset.md) for a dataset via multipart POST.
 
-    Equivalent to the MCP upload_dataset tool but without the 500 kB payload
-    limit — suitable for large files that should not pass through LLM context.
+    Test data is intentionally not accepted here — it must be placed manually
+    in <datasets_dir>/_uploaded/<name>/protected/test.csv by the server operator.
+    This ensures held-out labels never pass through the agent or HTTP layer.
     """
     train_csv = (await train.read()).decode()
-    test_csv  = (await test.read()).decode()
-    return _save_dataset(name, train_csv, test_csv, dataset_md)
-
-
-@_upload_app.get("/logs/{run_id}")
-async def _http_get_logs(run_id: str) -> PlainTextResponse:
-    """Return the captured CmdStan log output for a run."""
-    if not re.fullmatch(r"[0-9a-f]{12}", run_id):
-        raise HTTPException(status_code=400, detail="invalid run_id")
-    logs_file = _RESULTS_DIR / "_runs" / run_id / "logs.txt"
-    if not logs_file.exists():
-        raise HTTPException(status_code=404, detail=f"run '{run_id}' not found")
-    return PlainTextResponse(logs_file.read_text())
-
-
-@_upload_app.get("/samples/{run_id}")
-async def _http_get_samples(run_id: str) -> Response:
-    """Return posterior draw CSVs for a run as a gzipped tar archive."""
-    if not re.fullmatch(r"[0-9a-f]{12}", run_id):
-        raise HTTPException(status_code=400, detail="invalid run_id")
-    samples_dir = _RESULTS_DIR / "_runs" / run_id / "samples"
-    if not samples_dir.exists():
-        raise HTTPException(status_code=404, detail=f"run '{run_id}' not found")
-    buf = io.BytesIO()
-    with tarfile.open(fileobj=buf, mode="w:gz") as tar:
-        for csv_file in sorted(samples_dir.glob("*.csv")):
-            tar.add(csv_file, arcname=csv_file.name)
-    return Response(
-        buf.getvalue(),
-        media_type="application/gzip",
-        headers={"Content-Disposition": f'attachment; filename="samples_{run_id}.tar.gz"'},
-    )
+    dataset_md_str = (await dataset_md.read()).decode() if dataset_md else None
+    return _save_dataset(name, train_csv, dataset_md_str)
 
 
 mcp = FastMCP("stan")
@@ -371,7 +370,11 @@ def _load_dataset(dataset: str) -> tuple[dict, list]:
     md_path    = ds_dir / "dataset.md"
 
     if not train_path.exists():
-        candidates = [p.parent.name for p in _DATASETS_DIR.glob("*/train.csv")]
+        candidates = [
+            str(p.parent.relative_to(_DATASETS_DIR))
+            for p in _DATASETS_DIR.glob("**/train.csv")
+            if _UPLOAD_DIR not in p.parts
+        ]
         raise ValueError(f"Dataset '{dataset}' not found. Available: {candidates}")
     if not test_path.exists():
         raise ValueError(f"Test file not found at {test_path}")
@@ -407,15 +410,26 @@ def _load_dataset(dataset: str) -> tuple[dict, list]:
     data: dict = {"N_train": n_train, "N_test": n_test}
 
     for csv_col, stan_base in csv_to_base.items():
-        if csv_col not in test_cols:
-            raise ValueError(f"Column '{csv_col}' missing from test.csv")
+        # Resolve test column: standard convention uses same name as train CSV;
+        # intuitive convention uses {base}_test in test.csv.
+        if csv_col in test_cols:
+            test_csv_col = csv_col
+        elif f"{stan_base}_test" in test_cols:
+            test_csv_col = f"{stan_base}_test"
+        elif stan_base in test_cols:
+            test_csv_col = stan_base
+        else:
+            raise ValueError(
+                f"Column '{csv_col}' (or '{stan_base}_test') missing from test.csv. "
+                f"test.csv columns: {list(test_cols.keys())}"
+            )
         dtype = train_vars.get(stan_base, "float")
         if dtype == "int":
             data[f"{stan_base}_train"] = [int(v) for v in train_cols[csv_col]]
-            data[f"{stan_base}_test"]  = [int(v) for v in test_cols[csv_col]]
+            data[f"{stan_base}_test"]  = [int(v) for v in test_cols[test_csv_col]]
         else:
             data[f"{stan_base}_train"] = train_cols[csv_col].tolist()
-            data[f"{stan_base}_test"]  = test_cols[csv_col].tolist()
+            data[f"{stan_base}_test"]  = test_cols[test_csv_col].tolist()
 
     if has_J and j_var_bases:
         j_csv_cols = [c for c, b in csv_to_base.items() if b in j_var_bases]
@@ -425,8 +439,14 @@ def _load_dataset(dataset: str) -> tuple[dict, list]:
             all_ids.update(int(v) for v in test_cols[c])
         data["J"] = len(all_ids)
 
-    y_test_arrays = [test_cols[c].tolist() for c in response_cols if c in test_cols]
-    y_test = [v for arr in y_test_arrays for v in arr]  # concatenate all response cols
+    # Resolve response columns in test.csv using same fallback as above.
+    resolved_test_response: list[np.ndarray] = []
+    for c in response_cols:
+        if c in test_cols:
+            resolved_test_response.append(test_cols[c])
+        elif f"{c}_test" in test_cols:
+            resolved_test_response.append(test_cols[f"{c}_test"])
+    y_test = [v for arr in resolved_test_response for v in arr.tolist()]
     return data, y_test
 
 def _read_log(dataset: str) -> list[dict]:
@@ -502,15 +522,17 @@ def fit_and_evaluate(
     loaded automatically from <datasets_dir>/<dataset>/train.csv and
     <datasets_dir>/<dataset>/protected/test.csv.
 
-    IMPORTANT — N and N_test are never injected automatically from the CSV.
-    You must declare them in the Stan `data` block and supply their values via
-    the `data` parameter (e.g. `data={"N": 80, "N_test": 20}`).  CSV columns
-    are only loaded when a `## Data Interface` Stan block is present in
-    `dataset.md`; without it only N_train/N_test scalars reach CmdStan and
-    sampling will fail with a dimension mismatch.
+    NOTE — N_train and N_test are injected automatically from the CSV row
+    counts.  Only pass `data` when you need to override them or supply
+    additional scalars the CSV does not provide.
 
-    When `notes`, `rationale`, and `dataset` are all provided the result is
-    appended to <results_dir>/<dataset>/log.jsonl.
+    This tool only works for pre-staged datasets that have a protected test
+    set (protected/test.csv placed by the server operator).  For uploaded
+    (train-only) datasets use `sample` instead and compute PSIS-LOO yourself
+    on the training log_lik.
+
+    When `dataset` is provided the result is appended to
+    <results_dir>/<dataset>/log.jsonl (with or without notes/rationale).
 
     Returns scalar diagnostics and NLPD inline.  Posterior draws and CmdStan
     logs are stored under a `run_id` and their filesystem paths are returned
@@ -527,13 +549,26 @@ def fit_and_evaluate(
     if data is None:
         if dataset is None:
             return {"status": "error", "stage": "input", "message": "Either 'data' (with 'y_test') or 'dataset' must be provided."}
+        # Reject train-only (uploaded) datasets — no held-out test set exists.
+        test_path = _DATASETS_DIR / dataset / "protected" / "test.csv"
+        if not test_path.exists():
+            return {
+                "status": "error",
+                "stage": "input",
+                "message": (
+                    f"Dataset '{dataset}' has no held-out test set (protected/test.csv). "
+                    "Uploaded datasets are train-only. Use 'sample' instead and compute "
+                    "PSIS-LOO on the training log_lik yourself."
+                ),
+            }
         try:
             data, y_test = _load_dataset(dataset)
         except ValueError as exc:
             return {"status": "error", "stage": "data_loading", "message": str(exc)}
 
-    if y_test is None:
-        return {"status": "error", "stage": "input", "message": "'y_test' is required when 'data' is passed explicitly."}
+    # y_test is optional in explicit-data mode: it is only used for the
+    # log_lik shape check. NLPD is computed from log_lik alone. When omitted,
+    # the shape check is skipped and the user is responsible for correctness.
 
     if not re.search(r'\blog_lik\b', stan_code):
         return {"status": "error", "stage": "missing_log_lik", "message": "no 'log_lik' found in stan_code — required for NLPD computation"}
@@ -576,8 +611,8 @@ def fit_and_evaluate(
     if log_lik.ndim == 1:
         log_lik = log_lik[:, np.newaxis]
 
-    n_test = len(y_test)
-    if log_lik.shape[1] != n_test:
+    n_test = len(y_test) if y_test is not None else log_lik.shape[1]
+    if y_test is not None and log_lik.shape[1] != n_test:
         return {"status": "error", "stage": "missing_log_lik", "message": f"log_lik has {log_lik.shape[1]} columns but y_test has {n_test} elements"}
 
     nlpd = _compute_nlpd(log_lik)
@@ -587,6 +622,11 @@ def fit_and_evaluate(
     except Exception:
         diag = {"n_divergences": -1, "r_hat_max": float("nan"), "ess_bulk_min": -1}
 
+    try:
+        param_summary = _make_param_summary(fit)
+    except Exception:
+        param_summary = {}
+
     result: dict = {
         "status": "ok",
         "run_id": run_id,
@@ -595,15 +635,13 @@ def fit_and_evaluate(
         "r_hat_max": diag["r_hat_max"],
         "ess_bulk_min": diag["ess_bulk_min"],
         "runtime_sec": runtime_sec,
-        # Filesystem paths — accessible directly when --results-dir is mounted
-        # via SSHFS on the client. HTTP download endpoints (/logs/{run_id},
-        # /samples/{run_id}) are reserved for future --public-base-url /
-        # Tailscale support and are not referenced here.
+        "param_summary": param_summary,
+        "data_keys_loaded": sorted(data.keys()),
         "logs_path":    str(run_dir / "logs.txt"),
         "samples_path": str(run_dir),
     }
 
-    if dataset is not None and notes is not None:
+    if dataset is not None:
         existing = _read_log(dataset)
         iter_num = len(existing)
         improved = None if iter_num == 0 else bool(nlpd < min(e["nlpd"] for e in existing if "nlpd" in e))
@@ -674,16 +712,19 @@ def sample(
     except Exception:
         diag = {"n_divergences": -1, "r_hat_max": float("nan"), "ess_bulk_min": -1}
 
+    try:
+        param_summary = _make_param_summary(fit)
+    except Exception:
+        param_summary = {}
+
     result: dict = {
         "status": "ok",
         "run_id": run_id,
         "n_samples": cfg["chains"] * cfg["iter_sampling"],
         "runtime_sec": runtime_sec,
         "diagnostics": diag,
-        # Filesystem paths — accessible directly when --results-dir is mounted
-        # via SSHFS on the client. HTTP download endpoints (/logs/{run_id},
-        # /samples/{run_id}) are reserved for future --public-base-url /
-        # Tailscale support and are not referenced here.
+        "param_summary": param_summary,
+        "data_keys_loaded": sorted(data.keys()),
         "logs_path":    str(run_dir / "logs.txt"),
         "samples_path": str(run_dir),
     }
@@ -700,11 +741,14 @@ def get_data_summary(dataset: str) -> dict:
     Reads <datasets_dir>/<dataset>/train.csv and dataset.md.
     The response column of the test set is not exposed (held-out integrity).
 
-    IMPORTANT — N and N_test are not injected automatically into Stan data.
-    After reviewing this summary, declare them in the Stan `data` block and
-    supply their values via the `data` parameter of `fit_and_evaluate`
-    (e.g. `data={"N": n_train, "N_test": n_test}`).
-    Also check that `dataset_md` contains a `## Data Interface` Stan block;
+    The `tier` field signals whether fit_and_evaluate is available:
+      - "staged"   : has a protected test set; fit_and_evaluate works.
+      - "uploaded" : train-only; use sample + PSIS-LOO instead.
+
+    N_train and N_test are injected automatically from the CSV row counts
+    when fit_and_evaluate loads the dataset.  Only pass the `data` parameter
+    when you need to override them or supply additional scalars.
+    Also check that dataset_md contains a ## Data Interface Stan block;
     without it no CSV columns will be loaded during sampling.
     """
     ds_dir     = _DATASETS_DIR / dataset
@@ -713,21 +757,30 @@ def get_data_summary(dataset: str) -> dict:
     test_path  = ds_dir / "protected" / "test.csv"
 
     if not train_path.exists():
-        candidates = [p.parent.name for p in _DATASETS_DIR.glob("*/train.csv")]
+        candidates = [
+            str(p.parent.relative_to(_DATASETS_DIR))
+            for p in _DATASETS_DIR.glob("**/train.csv")
+            if _UPLOAD_DIR not in p.parts
+        ]
         return {"status": "error", "message": f"Dataset '{dataset}' not found. Available: {candidates}"}
 
     train_cols = _load_csv_columns(train_path)
     dataset_md = md_path.read_text() if md_path.exists() else ""
     response_col = _find_response_col(dataset_md, list(train_cols.keys()))
 
+    has_test = test_path.exists()
+    tier = "staged" if has_test else "uploaded"
+
     n_train = len(next(iter(train_cols.values())))
     n_test: Optional[int] = None
-    if test_path.exists():
+    if has_test:
         test_cols = _load_csv_columns(test_path)
         n_test = len(next(iter(test_cols.values())))
 
     return {
         "dataset": dataset,
+        "tier": tier,
+        "has_test": has_test,
         "n_train": n_train,
         "n_test": n_test,
         "columns": {col: _col_stats(arr) for col, arr in train_cols.items()},
@@ -769,16 +822,19 @@ def get_upload_instructions() -> dict:
         "content_type": "multipart/form-data",
         "fields": {
             "train":      "required — CSV file (training data, must include header row)",
-            "test":       "required — CSV file (held-out test data, must include header row)",
-            "dataset_md": "optional — plain-text field with ## Data Interface block for variable annotations",
+            "dataset_md": "optional — dataset.md file with ## Data Interface block for variable annotations",
         },
         "example_curl": (
             f"curl -X POST {base_url}/dataset/my_experiment "
-            "-F train=@train.csv -F test=@test.csv -F dataset_md=@dataset.md"
+            "-F train=@train.csv -F dataset_md=@dataset.md"
         ),
         "note": (
+            "Test data is NOT accepted here — place it manually at "
+            "<datasets_dir>/_uploaded/<name>/protected/test.csv to enable fit_and_evaluate. "
+            "Train-only (uploaded) datasets support only the 'sample' tool; "
+            "use PSIS-LOO on the training log_lik for model comparison. "
             "After a successful upload the qualified dataset name is '_uploaded/<name>', "
-            "e.g. '_uploaded/my_experiment'.  Pass this to fit_and_evaluate / get_data_summary."
+            "e.g. '_uploaded/my_experiment'.  Pass this to sample / get_data_summary."
         ),
     }
 
@@ -790,20 +846,32 @@ def list_datasets() -> dict:
     """List all available datasets on the server.
 
     Returns two lists:
-      - datasets : top-level pre-staged datasets under --datasets-dir
-      - uploaded : datasets pushed via the HTTP upload endpoint (under _uploaded/)
+      - datasets : benchmark datasets under --datasets-dir/benchmarks/
+                   (these have a protected test set and support fit_and_evaluate)
+      - uploaded : datasets pushed via the HTTP upload endpoint (train-only;
+                   use sample + PSIS-LOO, not fit_and_evaluate)
+
+    Dataset names for benchmarks are relative paths from --datasets-dir,
+    e.g. 'benchmarks/regression_1d'. Pass this full name to fit_and_evaluate.
     """
+    benchmarks_dir = _DATASETS_DIR / "benchmarks"
     top_level = sorted(
-        p.parent.name
-        for p in _DATASETS_DIR.glob("*/train.csv")
-        if p.parent.name != _UPLOAD_DIR
+        str(p.parent.relative_to(_DATASETS_DIR))
+        for p in _DATASETS_DIR.glob("**/train.csv")
+        if _UPLOAD_DIR not in p.parts
     )
     uploaded_dir = _DATASETS_DIR / _UPLOAD_DIR
     uploaded = sorted(
         f"{_UPLOAD_DIR}/{p.parent.name}"
         for p in uploaded_dir.glob("*/train.csv")
     ) if uploaded_dir.exists() else []
-    return {"datasets": top_level, "uploaded": uploaded}
+    # Annotate each uploaded dataset with its current tier (may be "staged" if
+    # the user has since manually placed protected/test.csv).
+    uploaded_tiers = {
+        name: ("staged" if (_DATASETS_DIR / name / "protected" / "test.csv").exists() else "uploaded")
+        for name in uploaded
+    }
+    return {"datasets": top_level, "uploaded": uploaded, "uploaded_tiers": uploaded_tiers}
 
 
 # ── Tool: get_run_history ─────────────────────────────────────────────────────
@@ -949,4 +1017,5 @@ def main() -> None:
 
 
 if __name__ == "__main__":
+    print("Starting Stan MCP Server (Version 2026/4/26 13:09)...")
     main()
