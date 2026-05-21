@@ -1,0 +1,6 @@
+{
+  "seed": 20260429,
+  "J": 24,
+  "n_train_per_unit": 25,
+  "n_test_per_unit": 50
+}

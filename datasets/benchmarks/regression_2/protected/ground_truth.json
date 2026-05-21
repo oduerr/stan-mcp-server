@@ -1,0 +1,10 @@
+{
+  "oracle_nlpd": 2.8217,
+  "alpha_true": 0.5,
+  "beta_true": 0.3,
+  "phi_true": 3.0,
+  "mean_function": "exp(0.5 + 0.3 * x)",
+  "likelihood": "NegativeBinomial(mu, phi=3)",
+  "n_train": 200,
+  "n_test": 100
+}

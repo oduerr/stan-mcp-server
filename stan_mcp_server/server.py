@@ -628,10 +628,28 @@ def fit_and_evaluate(
     except Exception:
         param_summary = {}
 
+    # ── Diagnostics validity gate ──────────────────────────────────────────────
+    # A result is only valid when all diagnostics are finite/non-sentinel and
+    # NLPD itself is finite.  An invalid result must never be accepted as a
+    # best-model improvement by the calling loop.
+    import math
+    _diag_reasons: list[str] = []
+    if not math.isfinite(nlpd):
+        _diag_reasons.append(f"nlpd is not finite ({nlpd})")
+    if diag["n_divergences"] < 0:
+        _diag_reasons.append("n_divergences sentinel (-1): diagnostic extraction failed")
+    if not math.isfinite(diag["r_hat_max"]):
+        _diag_reasons.append(f"r_hat_max is not finite ({diag['r_hat_max']})")
+    if diag["ess_bulk_min"] < 0:
+        _diag_reasons.append(f"ess_bulk_min sentinel ({diag['ess_bulk_min']}): diagnostic extraction failed")
+    diagnostics_valid = len(_diag_reasons) == 0
+    result_status = "ok" if diagnostics_valid else "invalid"
+
     result: dict = {
-        "status": "ok",
+        "status": result_status,
+        "diagnostics_valid": diagnostics_valid,
         "run_id": run_id,
-        "nlpd": round(nlpd, 4),
+        "nlpd": round(nlpd, 4) if math.isfinite(nlpd) else None,
         "n_divergences": diag["n_divergences"],
         "r_hat_max": diag["r_hat_max"],
         "ess_bulk_min": diag["ess_bulk_min"],
@@ -641,15 +659,25 @@ def fit_and_evaluate(
         "logs_path":    str(run_dir / "logs.txt"),
         "samples_path": str(run_dir),
     }
+    if not diagnostics_valid:
+        result["invalid_reasons"] = _diag_reasons
 
     if dataset is not None:
         existing = _read_log(dataset)
         iter_num = len(existing)
-        improved = None if iter_num == 0 else bool(nlpd < min(e["nlpd"] for e in existing if "nlpd" in e))
+        # Only consider an iteration as improved when diagnostics are fully valid.
+        prior_valid_nlpds = [e["nlpd"] for e in existing if e.get("nlpd") is not None and e.get("diagnostics_valid", True)]
+        if not diagnostics_valid:
+            improved = False
+        elif iter_num == 0 or not prior_valid_nlpds:
+            improved = None
+        else:
+            improved = bool(nlpd < min(prior_valid_nlpds))
         _append_log(dataset, {
             "iter": iter_num,
             "run_id": run_id,
-            "nlpd": round(nlpd, 4),
+            "nlpd": round(nlpd, 4) if math.isfinite(nlpd) else None,
+            "diagnostics_valid": diagnostics_valid,
             "improved": improved,
             "machine": socket.gethostname(),
             "runtime_sec": runtime_sec,

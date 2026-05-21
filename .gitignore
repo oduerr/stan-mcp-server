@@ -17,7 +17,9 @@ uv.lock
 
 # Results / datasets (local data — not versioned)
 results/
-datasets/
+datasets/*
+!datasets/benchmarks/
+!datasets/benchmarks/**
 
 # Editor
 .DS_Store
