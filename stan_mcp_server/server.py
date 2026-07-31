@@ -43,6 +43,7 @@ import json
 import logging
 import os
 import re
+import shutil
 import socket
 import tempfile
 import threading
@@ -687,8 +688,18 @@ def fit_and_evaluate(
     # log_lik for a 5000-point shadow set across 4000 draws is a ~150 MB CSV,
     # and cmdstanpy keeps its temp files for the lifetime of the process — in a
     # long-lived server that fills the disk within hours.
+    #
+    # Free-space guard: a model whose generated-quantities block emits more
+    # than log_lik (y_rep, mu, …) produces N_shadow x draws numbers PER
+    # variable.  One such model wrote a 14 GB CSV on 2026-07-31 and filled the
+    # disk, which blocked every in-flight run.  Skip the shadow pass rather
+    # than risk the machine; a missing shadow_nlpd is recoverable, a jammed
+    # server is not.
     shadow_nlpd = None
-    if dataset is not None and (_DATASETS_DIR / dataset / "protected" / "shadow.csv").exists():
+    _free_gb = shutil.disk_usage(str(_RESULTS_DIR)).free / 2**30
+    if _free_gb < 25:
+        logging.warning("skipping shadow pass: only %.1f GB free", _free_gb)
+    elif dataset is not None and (_DATASETS_DIR / dataset / "protected" / "shadow.csv").exists():
         try:
             shadow_data, _ = _load_dataset(dataset, test_file="shadow.csv")
             with tempfile.TemporaryDirectory(prefix="shadow_gq_") as gq_dir:
