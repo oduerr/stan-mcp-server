@@ -682,16 +682,24 @@ def fit_and_evaluate(
     # !! measurement — see the get_run_history incident (2026-07-30), where an
     # !! unlisted tool call exposed cross-session history for months' worth of
     # !! runs before anyone noticed.
+    #
+    # The GQ output is written to a scratch directory and deleted immediately:
+    # log_lik for a 5000-point shadow set across 4000 draws is a ~150 MB CSV,
+    # and cmdstanpy keeps its temp files for the lifetime of the process — in a
+    # long-lived server that fills the disk within hours.
     shadow_nlpd = None
     if dataset is not None and (_DATASETS_DIR / dataset / "protected" / "shadow.csv").exists():
         try:
             shadow_data, _ = _load_dataset(dataset, test_file="shadow.csv")
-            gq = model.generate_quantities(data=shadow_data, previous_fit=fit)
-            shadow_ll = np.asarray(gq.stan_variable("log_lik"))
-            if shadow_ll.ndim == 1:
-                shadow_ll = shadow_ll[:, np.newaxis]
-            s_nlpd = _compute_nlpd(shadow_ll)
-            shadow_nlpd = round(s_nlpd, 4) if math.isfinite(s_nlpd) else None
+            with tempfile.TemporaryDirectory(prefix="shadow_gq_") as gq_dir:
+                gq = model.generate_quantities(
+                    data=shadow_data, previous_fit=fit, gq_output_dir=gq_dir,
+                )
+                shadow_ll = np.asarray(gq.stan_variable("log_lik"))
+                if shadow_ll.ndim == 1:
+                    shadow_ll = shadow_ll[:, np.newaxis]
+                s_nlpd = _compute_nlpd(shadow_ll)
+                shadow_nlpd = round(s_nlpd, 4) if math.isfinite(s_nlpd) else None
         except Exception:
             shadow_nlpd = None      # never fail an evaluation over the shadow pass
 
