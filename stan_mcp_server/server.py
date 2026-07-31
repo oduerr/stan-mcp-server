@@ -696,8 +696,10 @@ def fit_and_evaluate(
     # than risk the machine; a missing shadow_nlpd is recoverable, a jammed
     # server is not.
     shadow_nlpd = None
+    # Threshold is sized against the worst case observed: ~14 GB at 5000
+    # shadow points, hence the shadow sets were cut to 2000 (worst case ~6 GB).
     _free_gb = shutil.disk_usage(str(_RESULTS_DIR)).free / 2**30
-    if _free_gb < 25:
+    if _free_gb < 10:
         logging.warning("skipping shadow pass: only %.1f GB free", _free_gb)
     elif dataset is not None and (_DATASETS_DIR / dataset / "protected" / "shadow.csv").exists():
         try:
