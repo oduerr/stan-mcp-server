@@ -356,17 +356,20 @@ def _parse_data_interface(dataset_md: str) -> dict:
     return {"train_vars": train_vars, "has_J": has_J, "j_var_bases": j_var_bases}
 
 
-def _load_dataset(dataset: str) -> tuple[dict, list]:
+def _load_dataset(dataset: str, test_file: str = "test.csv") -> tuple[dict, list]:
     """Load train + test CSVs for a named dataset into a Stan data dict.
 
     Reads <datasets_dir>/<dataset>/train.csv and
-          <datasets_dir>/<dataset>/protected/test.csv.
+          <datasets_dir>/<dataset>/protected/<test_file>.
     Variable names are derived from the ## Data Interface block in dataset.md;
     Stan base names must match the CSV column names exactly.
+
+    ``test_file`` exists so the same loader can build the SHADOW evaluation
+    data (protected/shadow.csv) — see the shadow block in fit_and_evaluate.
     """
     ds_dir = _DATASETS_DIR / dataset
     train_path = ds_dir / "train.csv"
-    test_path  = ds_dir / "protected" / "test.csv"
+    test_path  = ds_dir / "protected" / test_file
     md_path    = ds_dir / "dataset.md"
 
     if not train_path.exists():
@@ -662,6 +665,36 @@ def fit_and_evaluate(
     if not diagnostics_valid:
         result["invalid_reasons"] = _diag_reasons
 
+    # ── SHADOW evaluation ─────────────────────────────────────────────────────
+    # A second held-out set that the agent never receives feedback on.  The gap
+    # between `nlpd` (which the agent optimises against, iteration after
+    # iteration) and `shadow_nlpd` measures test-set selection bias — how much
+    # of a reported improvement is real generalisation versus fitting the noise
+    # in the one fixed feedback sample.
+    #
+    # Cost is negligible: the posterior draws already exist, so this is a
+    # standalone generated-quantities pass (~4 s for 5000 points vs ~75 s for
+    # the fit).
+    #
+    # !! shadow_nlpd goes into the SERVER-SIDE LOG ONLY.  It must never enter
+    # !! `result`, because `result` is returned to the model.  Leaking it would
+    # !! turn the shadow set into a second feedback set and silently destroy the
+    # !! measurement — see the get_run_history incident (2026-07-30), where an
+    # !! unlisted tool call exposed cross-session history for months' worth of
+    # !! runs before anyone noticed.
+    shadow_nlpd = None
+    if dataset is not None and (_DATASETS_DIR / dataset / "protected" / "shadow.csv").exists():
+        try:
+            shadow_data, _ = _load_dataset(dataset, test_file="shadow.csv")
+            gq = model.generate_quantities(data=shadow_data, previous_fit=fit)
+            shadow_ll = np.asarray(gq.stan_variable("log_lik"))
+            if shadow_ll.ndim == 1:
+                shadow_ll = shadow_ll[:, np.newaxis]
+            s_nlpd = _compute_nlpd(shadow_ll)
+            shadow_nlpd = round(s_nlpd, 4) if math.isfinite(s_nlpd) else None
+        except Exception:
+            shadow_nlpd = None      # never fail an evaluation over the shadow pass
+
     if dataset is not None:
         existing = _read_log(dataset)
         iter_num = len(existing)
@@ -677,6 +710,7 @@ def fit_and_evaluate(
             "iter": iter_num,
             "run_id": run_id,
             "nlpd": round(nlpd, 4) if math.isfinite(nlpd) else None,
+            "shadow_nlpd": shadow_nlpd,     # server-side only — never returned to the model
             "diagnostics_valid": diagnostics_valid,
             "improved": improved,
             "machine": socket.gethostname(),
