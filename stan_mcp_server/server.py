@@ -707,6 +707,13 @@ def fit_and_evaluate(
             with tempfile.TemporaryDirectory(prefix="shadow_gq_") as gq_dir:
                 gq = model.generate_quantities(
                     data=shadow_data, previous_fit=fit, gq_output_dir=gq_dir,
+                    # 4 sig figs instead of CmdStan's 6. Measured on iter_012
+                    # against the 2000-point shadow set: identical NLPD to six
+                    # decimals (2.059894 either way), output 68.8 -> 53.5 MB.
+                    # Worth having because the PEAK during the pass is what
+                    # filled the disk, not the leftovers — those are already
+                    # dropped with the TemporaryDirectory below.
+                    sig_figs=4,
                 )
                 shadow_ll = np.asarray(gq.stan_variable("log_lik"))
                 if shadow_ll.ndim == 1:
