@@ -476,6 +476,37 @@ def _append_log(dataset: str, entry: dict) -> None:
         f.write(json.dumps(entry) + "\n")
 
 
+# ── Shadow containment ─────────────────────────────────────────────────────────
+# `shadow_nlpd` is written into log.jsonl on purpose — the shadow measurement is
+# useless if it isn't recorded — but it must never reach the model.  The moment
+# the agent can see it, the shadow set becomes a second feedback set and stops
+# measuring anything.
+#
+# So every tool that surfaces log entries has to scrub them first.  get_run_history
+# returns whole entries verbatim and did leak shadow_nlpd for the entire life of
+# the shadow branch; that is the same tool as the 2026-07-30 incident, and the
+# same failure mode: a path nobody thought of as an output.  Scrub at the exit,
+# not at each call site, so a new tool that reads the log is safe by default.
+#
+# Matched on the key *name* — anything containing "shadow", at any depth — rather
+# than on the one key known today.  An exact-match filter silently stops covering
+# shadow_ess, shadow_n, or a nested shadow block the day someone adds one.
+_SHADOW_KEY_RE = re.compile(r"shadow", re.IGNORECASE)
+
+
+def _scrub_shadow(obj):
+    """Recursively drop every shadow-named key from a structure bound for the model."""
+    if isinstance(obj, dict):
+        return {
+            k: _scrub_shadow(v)
+            for k, v in obj.items()
+            if not _SHADOW_KEY_RE.search(str(k))
+        }
+    if isinstance(obj, list):
+        return [_scrub_shadow(v) for v in obj]
+    return obj
+
+
 # ── Tool: check_model ──────────────────────────────────────────────────────────
 
 @mcp.tool()
@@ -969,7 +1000,9 @@ def get_run_history(dataset: str) -> dict:
     chronological order.  Also surfaces the best NLPD seen so far, making
     it easy for the agent to decide whether a new model improved.
     """
-    entries = _read_log(dataset)
+    # Scrubbed, not raw: log entries carry shadow_nlpd, which the agent must
+    # never see (see _scrub_shadow).  The feedback `nlpd` survives untouched.
+    entries = [_scrub_shadow(e) for e in _read_log(dataset)]
     if not entries:
         return {"dataset": dataset, "n_entries": 0, "best_nlpd": None, "entries": []}
     nlpds = [e["nlpd"] for e in entries if "nlpd" in e]
@@ -1055,6 +1088,17 @@ def main() -> None:
         choices=["streamable-http", "stdio"],
         help="MCP transport (default: streamable-http).  Use 'stdio' for Claude Desktop via SSH.",
     )
+    parser.add_argument(
+        "--include-run-history",
+        action="store_true",
+        help=(
+            "Expose the get_run_history tool (default: OFF). It returns the "
+            "dataset-wide log across ALL runs, sessions and agents, so a "
+            "benchmark agent could read another run's results. Off by default "
+            "so the guarantee does not depend on the client remembering to "
+            "exclude it. See TOOL_POLICY.md."
+        ),
+    )
     args = parser.parse_args()
 
     global _DATASETS_DIR, _RESULTS_DIR, _UPLOAD_PORT, _UPLOAD_HOST, _BEARER_TOKEN
@@ -1096,6 +1140,20 @@ def main() -> None:
         t.start()
     else:
         print("  upload   : disabled")
+
+    if args.include_run_history:
+        print("  history  : get_run_history EXPOSED (--include-run-history) — "
+              "returns results across all runs on a dataset; not suitable for "
+              "benchmark agents, see TOOL_POLICY.md")
+    else:
+        # Excluding it client-side is not enough: any other client connecting
+        # here (Claude Desktop, a re-implemented loop) would still see the
+        # tool. Unregister it so no client can call it.
+        try:
+            mcp.remove_tool("get_run_history")
+            print("  history  : get_run_history withheld (default)")
+        except Exception as exc:          # noqa: BLE001 - never fail startup
+            print(f"  WARNING: could not withhold get_run_history: {exc}")
 
     mcp.run(transport="streamable-http", host=args.host, port=args.port,
             middleware=token_middleware)
