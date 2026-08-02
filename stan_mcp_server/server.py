@@ -94,6 +94,12 @@ _DEFAULT_CONFIG = {
     "iter_warmup": 1000,
     "iter_sampling": 1000,
     "seed": 42,
+    # Wall-clock ceiling per fit. A pathological posterior (every HMC step
+    # hitting max treedepth) samples forever: a trivial NegBin GLM once ran
+    # 57 min at 99.9% CPU with its output frozen. The client cannot defend
+    # itself — its `requests` timeout is a READ timeout and the streamable-http
+    # transport keeps the connection warm — so the limit has to live here.
+    "max_runtime_sec": 900,
 }
 
 # ── Shared dataset-save logic (used by both MCP tool and HTTP endpoint) ────────
@@ -235,6 +241,16 @@ def _merge_config(config: Optional[dict]) -> dict:
         for k in ("chains", "iter_warmup", "iter_sampling", "seed"):
             if k in config:
                 cfg[k] = config[k]
+        # The runtime ceiling may only be LOWERED by the caller. Letting an
+        # agent raise it would defeat the guard — the models that need
+        # stopping are exactly the ones that would ask for more time.
+        if "max_runtime_sec" in config:
+            try:
+                asked = float(config["max_runtime_sec"])
+                if asked > 0:
+                    cfg["max_runtime_sec"] = min(asked, _DEFAULT_CONFIG["max_runtime_sec"])
+            except (TypeError, ValueError):
+                pass
     return cfg
 
 
@@ -601,7 +617,27 @@ def fit_and_evaluate(
                 show_progress=False,
                 show_console=False,
                 output_dir=str(samples_dir),
+                timeout=cfg["max_runtime_sec"],
             )
+        except TimeoutError:
+            (run_dir / "logs.txt").write_text(log_buf.getvalue())
+            # Returned as a normal error, not raised: the agent should learn
+            # "too slow, simplify" and keep iterating.
+            return {
+                "status": "error",
+                "stage": "sampling_timeout",
+                "message": (
+                    f"Sampling exceeded {cfg['max_runtime_sec']}s and was stopped. "
+                    "This usually means the posterior geometry is pathological "
+                    "(e.g. a latent GP over many points, or an unidentified "
+                    "scale parameter), not that the model is merely large. "
+                    "Try a lower-dimensional parameterisation — a basis "
+                    "expansion instead of a full GP, tighter priors on scales, "
+                    "or non-centred parameterisation."
+                ),
+                "run_id": run_id,
+                "runtime_sec": cfg["max_runtime_sec"],
+            }
         except Exception as exc:
             (run_dir / "logs.txt").write_text(log_buf.getvalue())
             return {"status": "error", "stage": "sampling", "message": str(exc)[:500]}
@@ -792,7 +828,27 @@ def sample(
                 show_progress=False,
                 show_console=False,
                 output_dir=str(samples_dir),
+                timeout=cfg["max_runtime_sec"],
             )
+        except TimeoutError:
+            (run_dir / "logs.txt").write_text(log_buf.getvalue())
+            # Returned as a normal error, not raised: the agent should learn
+            # "too slow, simplify" and keep iterating.
+            return {
+                "status": "error",
+                "stage": "sampling_timeout",
+                "message": (
+                    f"Sampling exceeded {cfg['max_runtime_sec']}s and was stopped. "
+                    "This usually means the posterior geometry is pathological "
+                    "(e.g. a latent GP over many points, or an unidentified "
+                    "scale parameter), not that the model is merely large. "
+                    "Try a lower-dimensional parameterisation — a basis "
+                    "expansion instead of a full GP, tighter priors on scales, "
+                    "or non-centred parameterisation."
+                ),
+                "run_id": run_id,
+                "runtime_sec": cfg["max_runtime_sec"],
+            }
         except Exception as exc:
             (run_dir / "logs.txt").write_text(log_buf.getvalue())
             return {"status": "error", "stage": "sampling", "message": str(exc)[:500]}
