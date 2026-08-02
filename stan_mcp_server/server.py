@@ -43,6 +43,7 @@ import json
 import logging
 import os
 import re
+import shutil
 import socket
 import tempfile
 import threading
@@ -356,17 +357,20 @@ def _parse_data_interface(dataset_md: str) -> dict:
     return {"train_vars": train_vars, "has_J": has_J, "j_var_bases": j_var_bases}
 
 
-def _load_dataset(dataset: str) -> tuple[dict, list]:
+def _load_dataset(dataset: str, test_file: str = "test.csv") -> tuple[dict, list]:
     """Load train + test CSVs for a named dataset into a Stan data dict.
 
     Reads <datasets_dir>/<dataset>/train.csv and
-          <datasets_dir>/<dataset>/protected/test.csv.
+          <datasets_dir>/<dataset>/protected/<test_file>.
     Variable names are derived from the ## Data Interface block in dataset.md;
     Stan base names must match the CSV column names exactly.
+
+    ``test_file`` exists so the same loader can build the SHADOW evaluation
+    data (protected/shadow.csv) — see the shadow block in fit_and_evaluate.
     """
     ds_dir = _DATASETS_DIR / dataset
     train_path = ds_dir / "train.csv"
-    test_path  = ds_dir / "protected" / "test.csv"
+    test_path  = ds_dir / "protected" / test_file
     md_path    = ds_dir / "dataset.md"
 
     if not train_path.exists():
@@ -470,6 +474,37 @@ def _append_log(dataset: str, entry: dict) -> None:
     log_path.parent.mkdir(parents=True, exist_ok=True)
     with open(log_path, "a") as f:
         f.write(json.dumps(entry) + "\n")
+
+
+# ── Shadow containment ─────────────────────────────────────────────────────────
+# `shadow_nlpd` is written into log.jsonl on purpose — the shadow measurement is
+# useless if it isn't recorded — but it must never reach the model.  The moment
+# the agent can see it, the shadow set becomes a second feedback set and stops
+# measuring anything.
+#
+# So every tool that surfaces log entries has to scrub them first.  get_run_history
+# returns whole entries verbatim and did leak shadow_nlpd for the entire life of
+# the shadow branch; that is the same tool as the 2026-07-30 incident, and the
+# same failure mode: a path nobody thought of as an output.  Scrub at the exit,
+# not at each call site, so a new tool that reads the log is safe by default.
+#
+# Matched on the key *name* — anything containing "shadow", at any depth — rather
+# than on the one key known today.  An exact-match filter silently stops covering
+# shadow_ess, shadow_n, or a nested shadow block the day someone adds one.
+_SHADOW_KEY_RE = re.compile(r"shadow", re.IGNORECASE)
+
+
+def _scrub_shadow(obj):
+    """Recursively drop every shadow-named key from a structure bound for the model."""
+    if isinstance(obj, dict):
+        return {
+            k: _scrub_shadow(v)
+            for k, v in obj.items()
+            if not _SHADOW_KEY_RE.search(str(k))
+        }
+    if isinstance(obj, list):
+        return [_scrub_shadow(v) for v in obj]
+    return obj
 
 
 # ── Tool: check_model ──────────────────────────────────────────────────────────
@@ -662,6 +697,56 @@ def fit_and_evaluate(
     if not diagnostics_valid:
         result["invalid_reasons"] = _diag_reasons
 
+    # ── SHADOW evaluation ─────────────────────────────────────────────────────
+    # A second held-out set that the agent never receives feedback on.  The gap
+    # between `nlpd` (which the agent optimises against, iteration after
+    # iteration) and `shadow_nlpd` measures test-set selection bias — how much
+    # of a reported improvement is real generalisation versus fitting the noise
+    # in the one fixed feedback sample.
+    #
+    # Cost is negligible: the posterior draws already exist, so this is a
+    # standalone generated-quantities pass (~4 s for 5000 points vs ~75 s for
+    # the fit).
+    #
+    # !! shadow_nlpd goes into the SERVER-SIDE LOG ONLY.  It must never enter
+    # !! `result`, because `result` is returned to the model.  Leaking it would
+    # !! turn the shadow set into a second feedback set and silently destroy the
+    # !! measurement — see the get_run_history incident (2026-07-30), where an
+    # !! unlisted tool call exposed cross-session history for months' worth of
+    # !! runs before anyone noticed.
+    #
+    # The GQ output is written to a scratch directory and deleted immediately:
+    # log_lik for a 5000-point shadow set across 4000 draws is a ~150 MB CSV,
+    # and cmdstanpy keeps its temp files for the lifetime of the process — in a
+    # long-lived server that fills the disk within hours.
+    #
+    # Free-space guard: a model whose generated-quantities block emits more
+    # than log_lik (y_rep, mu, …) produces N_shadow x draws numbers PER
+    # variable.  One such model wrote a 14 GB CSV on 2026-07-31 and filled the
+    # disk, which blocked every in-flight run.  Skip the shadow pass rather
+    # than risk the machine; a missing shadow_nlpd is recoverable, a jammed
+    # server is not.
+    shadow_nlpd = None
+    # Threshold is sized against the worst case observed: ~14 GB at 5000
+    # shadow points, hence the shadow sets were cut to 2000 (worst case ~6 GB).
+    _free_gb = shutil.disk_usage(str(_RESULTS_DIR)).free / 2**30
+    if _free_gb < 10:
+        logging.warning("skipping shadow pass: only %.1f GB free", _free_gb)
+    elif dataset is not None and (_DATASETS_DIR / dataset / "protected" / "shadow.csv").exists():
+        try:
+            shadow_data, _ = _load_dataset(dataset, test_file="shadow.csv")
+            with tempfile.TemporaryDirectory(prefix="shadow_gq_") as gq_dir:
+                gq = model.generate_quantities(
+                    data=shadow_data, previous_fit=fit, gq_output_dir=gq_dir,
+                )
+                shadow_ll = np.asarray(gq.stan_variable("log_lik"))
+                if shadow_ll.ndim == 1:
+                    shadow_ll = shadow_ll[:, np.newaxis]
+                s_nlpd = _compute_nlpd(shadow_ll)
+                shadow_nlpd = round(s_nlpd, 4) if math.isfinite(s_nlpd) else None
+        except Exception:
+            shadow_nlpd = None      # never fail an evaluation over the shadow pass
+
     if dataset is not None:
         existing = _read_log(dataset)
         iter_num = len(existing)
@@ -677,6 +762,7 @@ def fit_and_evaluate(
             "iter": iter_num,
             "run_id": run_id,
             "nlpd": round(nlpd, 4) if math.isfinite(nlpd) else None,
+            "shadow_nlpd": shadow_nlpd,     # server-side only — never returned to the model
             "diagnostics_valid": diagnostics_valid,
             "improved": improved,
             "machine": socket.gethostname(),
@@ -914,7 +1000,9 @@ def get_run_history(dataset: str) -> dict:
     chronological order.  Also surfaces the best NLPD seen so far, making
     it easy for the agent to decide whether a new model improved.
     """
-    entries = _read_log(dataset)
+    # Scrubbed, not raw: log entries carry shadow_nlpd, which the agent must
+    # never see (see _scrub_shadow).  The feedback `nlpd` survives untouched.
+    entries = [_scrub_shadow(e) for e in _read_log(dataset)]
     if not entries:
         return {"dataset": dataset, "n_entries": 0, "best_nlpd": None, "entries": []}
     nlpds = [e["nlpd"] for e in entries if "nlpd" in e]
@@ -1000,6 +1088,17 @@ def main() -> None:
         choices=["streamable-http", "stdio"],
         help="MCP transport (default: streamable-http).  Use 'stdio' for Claude Desktop via SSH.",
     )
+    parser.add_argument(
+        "--include-run-history",
+        action="store_true",
+        help=(
+            "Expose the get_run_history tool (default: OFF). It returns the "
+            "dataset-wide log across ALL runs, sessions and agents, so a "
+            "benchmark agent could read another run's results. Off by default "
+            "so the guarantee does not depend on the client remembering to "
+            "exclude it. See TOOL_POLICY.md."
+        ),
+    )
     args = parser.parse_args()
 
     global _DATASETS_DIR, _RESULTS_DIR, _UPLOAD_PORT, _UPLOAD_HOST, _BEARER_TOKEN
@@ -1041,6 +1140,20 @@ def main() -> None:
         t.start()
     else:
         print("  upload   : disabled")
+
+    if args.include_run_history:
+        print("  history  : get_run_history EXPOSED (--include-run-history) — "
+              "returns results across all runs on a dataset; not suitable for "
+              "benchmark agents, see TOOL_POLICY.md")
+    else:
+        # Excluding it client-side is not enough: any other client connecting
+        # here (Claude Desktop, a re-implemented loop) would still see the
+        # tool. Unregister it so no client can call it.
+        try:
+            mcp.remove_tool("get_run_history")
+            print("  history  : get_run_history withheld (default)")
+        except Exception as exc:          # noqa: BLE001 - never fail startup
+            print(f"  WARNING: could not withhold get_run_history: {exc}")
 
     mcp.run(transport="streamable-http", host=args.host, port=args.port,
             middleware=token_middleware)

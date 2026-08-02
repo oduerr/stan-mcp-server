@@ -63,6 +63,11 @@ python stan_mcp_server/server.py \
 
 ## Tools
 
+Which of these a **benchmark agent** may be offered — and which leak — is
+specified in [TOOL_POLICY.md](TOOL_POLICY.md). The table below is the full
+server surface, not the permitted agent surface.
+
+
 | Tool | Purpose |
 |------|---------|
 | `get_capabilities` | Query available tools, server configuration, and upload URL |
@@ -72,7 +77,7 @@ python stan_mcp_server/server.py \
 | `fit_and_evaluate` | Sample + compute NLPD on held-out test; pre-staged datasets only |
 | `sample` | Sample; returns scalar diagnostics + run asset paths |
 | `get_upload_instructions` | Return HTTP upload URL and field names for datasets |
-| `get_run_history` | Return the logged NLPD history for a dataset |
+| `get_run_history` | Return the logged NLPD history for a dataset — ⚠️ **cross-session; must not be offered to benchmark agents**, see [TOOL_POLICY.md](TOOL_POLICY.md) |
 
 **Recommended call order:**
 `get_capabilities` → `list_datasets` → `get_data_summary` → `check_model` →
