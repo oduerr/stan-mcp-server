@@ -3,8 +3,8 @@
 
 Serves tools over HTTP (streamable-http transport):
 
-    fit_and_evaluate        Sample + compute NLPD; returns run_id + diagnostics + URLs.
-    sample                  Sample + persist draws to disk; returns run_id + diagnostics + URLs.
+    fit_and_evaluate        Sample + compute NLPD; returns run_id + diagnostics + asset paths.
+    sample                  Sample + persist draws to disk; returns run_id + diagnostics + asset paths.
     check_model             Compile-only model check (syntax + log_lik presence).
     get_data_summary        Compact EDA for a named dataset.
     get_upload_instructions Return HTTP upload URL and field names for datasets.
@@ -13,10 +13,11 @@ Serves tools over HTTP (streamable-http transport):
     get_capabilities        Describe tools and current server configuration.
 
 Run assets (logs, posterior draws) are stored server-side under
-<results-dir>/_runs/<run_id>/ and served by the HTTP sidecar:
-    GET /logs/{run_id}     — CmdStan log output (plain text)
-    GET /samples/{run_id}  — posterior draw CSVs (tar.gz)
-    POST /dataset/{name}   — upload train/test CSVs (multipart)
+<results-dir>/_runs/<run_id>/; tools return their filesystem paths
+(`logs_path` / `samples_path`), directly accessible when --results-dir
+is mounted via SSHFS on the client.  The HTTP sidecar serves a single
+endpoint:
+    POST /dataset/{name}   — upload train CSV + optional dataset.md (multipart)
 
 Usage
 -----
@@ -35,14 +36,17 @@ Expected datasets layout:
 """
 
 import argparse
+import asyncio
 import contextlib
 import csv
 import hashlib
 import io
 import json
 import logging
+import math
 import os
 import re
+import secrets
 import shutil
 import socket
 import tempfile
@@ -61,6 +65,13 @@ from starlette.middleware import Middleware
 from starlette.requests import Request
 from starlette.responses import Response as StarletteResponse
 from starlette.types import ASGIApp, Receive, Scope, Send
+
+# Single-sourced from pyproject.toml; "0+dev" when running uninstalled.
+try:
+    from importlib.metadata import version as _pkg_version
+    _VERSION = _pkg_version("stan-mcp-server")
+except Exception:  # noqa: BLE001 - version is informational only
+    _VERSION = "0+dev"
 
 # ── Global path config (set by main() before the server starts) ────────────────
 _DATASETS_DIR:  Path = Path("datasets")
@@ -82,7 +93,8 @@ class _BearerTokenMiddleware:
         if scope["type"] == "http":
             headers = dict(scope.get("headers", []))
             auth = headers.get(b"authorization", b"").decode()
-            if auth != f"Bearer {_BEARER_TOKEN}":
+            # Constant-time comparison — the server may be bound to 0.0.0.0.
+            if not secrets.compare_digest(auth, f"Bearer {_BEARER_TOKEN}"):
                 response = StarletteResponse("Unauthorized", status_code=401)
                 await response(scope, receive, send)
                 return
@@ -235,12 +247,26 @@ def _get_model(stan_code: str):
     return cmdstanpy.CmdStanModel(stan_file=str(model_file))
 
 
+# Upper bounds on agent-supplied sampling settings.  The wall-clock guard
+# eventually stops a runaway fit, but e.g. chains=500 would still spawn 500
+# CmdStan processes before it fires — clamp before that can happen.
+_CONFIG_CAPS = {"chains": 16, "iter_warmup": 10_000, "iter_sampling": 10_000}
+
+
 def _merge_config(config: Optional[dict]) -> dict:
     cfg = dict(_DEFAULT_CONFIG)
     if config:
         for k in ("chains", "iter_warmup", "iter_sampling", "seed"):
             if k in config:
-                cfg[k] = config[k]
+                try:
+                    v = int(config[k])
+                except (TypeError, ValueError):
+                    continue  # ignore malformed values, keep the default
+                if k in _CONFIG_CAPS:
+                    if v < 1:
+                        continue
+                    v = min(v, _CONFIG_CAPS[k])
+                cfg[k] = v
         # The runtime ceiling may only be LOWERED by the caller. Letting an
         # agent raise it would defeat the guard — the models that need
         # stopping are exactly the ones that would ask for more time.
@@ -252,6 +278,22 @@ def _merge_config(config: Optional[dict]) -> dict:
             except (TypeError, ValueError):
                 pass
     return cfg
+
+
+def _resolve_under(base: Path, name: str) -> Path:
+    """Resolve base/name, refusing names that escape base (path traversal).
+
+    Dataset names are agent-supplied; without this check a name like
+    '../../x' would read (or, via the run log, write) outside the
+    configured directories.
+    """
+    root = base.resolve()
+    target = (root / name).resolve()
+    if not target.is_relative_to(root):
+        raise ValueError(
+            f"Invalid dataset name '{name}': escapes the {base.name} directory."
+        )
+    return target
 
 
 def _find_col(columns, *candidates: str) -> Optional[str]:
@@ -297,6 +339,10 @@ def _extract_compile_error(exc: Exception) -> str:
 
 
 def _load_csv_columns(path: Path) -> dict[str, np.ndarray]:
+    """Load CSV columns.  Numeric columns become float arrays; columns with any
+    non-numeric cell (strings, empty values) become object arrays of strings,
+    reported as categorical by _col_stats and rejected with a clear message if
+    used as Stan data."""
     with open(path, newline="") as f:
         reader = csv.DictReader(f)
         rows = list(reader)
@@ -305,11 +351,23 @@ def _load_csv_columns(path: Path) -> dict[str, np.ndarray]:
     cols: dict[str, list] = {k: [] for k in rows[0]}
     for row in rows:
         for k, v in row.items():
-            cols[k].append(float(v))
-    return {k: np.array(v) for k, v in cols.items()}
+            cols[k].append(v)
+    out: dict[str, np.ndarray] = {}
+    for k, vals in cols.items():
+        try:
+            out[k] = np.array([float(v) for v in vals])
+        except (TypeError, ValueError):
+            out[k] = np.array([str(v) for v in vals], dtype=object)
+    return out
 
 
 def _col_stats(arr: np.ndarray) -> dict:
+    if arr.dtype == object:  # non-numeric column → categorical summary
+        levels = sorted({str(v) for v in arr})
+        stats: dict = {"type": "categorical", "n_levels": len(levels), "levels": levels[:10]}
+        if len(levels) > 10:
+            stats["levels_note"] = f"first 10 of {len(levels)} levels shown"
+        return stats
     return {
         "min": round(float(np.min(arr)), 4),
         "max": round(float(np.max(arr)), 4),
@@ -384,7 +442,7 @@ def _load_dataset(dataset: str, test_file: str = "test.csv") -> tuple[dict, list
     ``test_file`` exists so the same loader can build the SHADOW evaluation
     data (protected/shadow.csv) — see the shadow block in fit_and_evaluate.
     """
-    ds_dir = _DATASETS_DIR / dataset
+    ds_dir = _resolve_under(_DATASETS_DIR, dataset)
     train_path = ds_dir / "train.csv"
     test_path  = ds_dir / "protected" / test_file
     md_path    = ds_dir / "dataset.md"
@@ -443,6 +501,12 @@ def _load_dataset(dataset: str, test_file: str = "test.csv") -> tuple[dict, list
                 f"Column '{csv_col}' (or '{stan_base}_test') missing from test.csv. "
                 f"test.csv columns: {list(test_cols.keys())}"
             )
+        if train_cols[csv_col].dtype == object or test_cols[test_csv_col].dtype == object:
+            raise ValueError(
+                f"Column '{csv_col}' contains non-numeric values and cannot be "
+                "passed to Stan. Encode it as integers (e.g. 1-based group ids) "
+                "in the CSV first."
+            )
         dtype = train_vars.get(stan_base, "float")
         if dtype == "int":
             data[f"{stan_base}_train"] = [int(v) for v in train_cols[csv_col]]
@@ -457,7 +521,15 @@ def _load_dataset(dataset: str, test_file: str = "test.csv") -> tuple[dict, list
         for c in j_csv_cols:
             all_ids.update(int(v) for v in train_cols[c])
             all_ids.update(int(v) for v in test_cols[c])
-        data["J"] = len(all_ids)
+        if all_ids and min(all_ids) < 1:
+            raise ValueError(
+                f"Group id columns {j_csv_cols} must be 1-based for Stan "
+                f"indexing (smallest id found: {min(all_ids)})."
+            )
+        # max, not len: models declare int<lower=1, upper=J> and index up to
+        # the largest id, so non-contiguous ids (e.g. {1, 5, 9}) would make
+        # len(all_ids) too small and crash the fit with an index error.
+        data["J"] = max(all_ids) if all_ids else 0
 
     # Resolve response columns in test.csv using same fallback as above.
     resolved_test_response: list[np.ndarray] = []
@@ -470,7 +542,7 @@ def _load_dataset(dataset: str, test_file: str = "test.csv") -> tuple[dict, list
     return data, y_test
 
 def _read_log(dataset: str) -> list[dict]:
-    log_path = _RESULTS_DIR / dataset / "log.jsonl"
+    log_path = _resolve_under(_RESULTS_DIR, dataset) / "log.jsonl"
     if not log_path.exists():
         return []
     entries = []
@@ -486,7 +558,7 @@ def _read_log(dataset: str) -> list[dict]:
 
 
 def _append_log(dataset: str, entry: dict) -> None:
-    log_path = _RESULTS_DIR / dataset / "log.jsonl"
+    log_path = _resolve_under(_RESULTS_DIR, dataset) / "log.jsonl"
     log_path.parent.mkdir(parents=True, exist_ok=True)
     with open(log_path, "a") as f:
         f.write(json.dumps(entry) + "\n")
@@ -521,6 +593,95 @@ def _scrub_shadow(obj):
     if isinstance(obj, list):
         return [_scrub_shadow(v) for v in obj]
     return obj
+
+
+# ── Shared compile → sample → persist path ─────────────────────────────────────
+# Used by both fit_and_evaluate and sample so the timeout handling, log capture
+# and asset layout cannot drift apart (they were copy-pasted once and had to be
+# patched in sync).
+
+_TIMEOUT_MESSAGE = (
+    "Sampling exceeded {limit}s and was stopped. "
+    "This usually means the posterior geometry is pathological "
+    "(e.g. a latent GP over many points, or an unidentified "
+    "scale parameter), not that the model is merely large. "
+    "Try a lower-dimensional parameterisation — a basis "
+    "expansion instead of a full GP, tighter priors on scales, "
+    "or non-centred parameterisation."
+)
+
+
+def _compile_and_sample(stan_code: str, data: dict, config: Optional[dict]) -> dict:
+    """Compile, sample with the wall-clock guard, and persist run assets.
+
+    Returns {"error": <result dict ready to return to the model>} on failure, or
+    {"model", "fit", "run_id", "run_dir", "runtime_sec", "cfg"} on success.
+    """
+    try:
+        model = _get_model(stan_code)
+    except Exception as exc:
+        return {"error": {"status": "error", "stage": "compilation",
+                          "message": _extract_compile_error(exc)}}
+
+    run_id = _make_run_id()
+    run_dir = _RESULTS_DIR / "_runs" / run_id
+    samples_dir = run_dir / "samples"
+    samples_dir.mkdir(parents=True, exist_ok=True)
+    (run_dir / "model.stan").write_text(stan_code)
+
+    cfg = _merge_config(config)
+    t0 = time.time()
+    with _capture_logs() as log_buf:
+        try:
+            fit = model.sample(
+                data=data,
+                chains=cfg["chains"],
+                iter_warmup=cfg["iter_warmup"],
+                iter_sampling=cfg["iter_sampling"],
+                seed=cfg["seed"],
+                show_progress=False,
+                show_console=False,
+                output_dir=str(samples_dir),
+                timeout=cfg["max_runtime_sec"],
+            )
+        except TimeoutError:
+            (run_dir / "logs.txt").write_text(log_buf.getvalue())
+            # Returned as a normal error, not raised: the agent should learn
+            # "too slow, simplify" and keep iterating.
+            return {"error": {
+                "status": "error",
+                "stage": "sampling_timeout",
+                "message": _TIMEOUT_MESSAGE.format(limit=cfg["max_runtime_sec"]),
+                "run_id": run_id,
+                "runtime_sec": cfg["max_runtime_sec"],
+            }}
+        except Exception as exc:
+            (run_dir / "logs.txt").write_text(log_buf.getvalue())
+            return {"error": {"status": "error", "stage": "sampling",
+                              "message": str(exc)[:500]}}
+    (run_dir / "logs.txt").write_text(log_buf.getvalue())
+
+    return {
+        "model": model,
+        "fit": fit,
+        "run_id": run_id,
+        "run_dir": run_dir,
+        "runtime_sec": round(time.time() - t0, 1),
+        "cfg": cfg,
+    }
+
+
+def _safe_fit_summaries(fit) -> tuple[dict, dict]:
+    """Diagnostics + parameter summary; degrade to sentinels rather than fail a run."""
+    try:
+        diag = _make_diagnostics(fit)
+    except Exception:
+        diag = {"n_divergences": -1, "r_hat_max": float("nan"), "ess_bulk_min": -1}
+    try:
+        param_summary = _make_param_summary(fit)
+    except Exception:
+        param_summary = {}
+    return diag, param_summary
 
 
 # ── Tool: check_model ──────────────────────────────────────────────────────────
@@ -597,11 +758,19 @@ def fit_and_evaluate(
     if not y_test:
         y_test = None
 
+    # Validate the agent-supplied dataset name once, up front — it is used for
+    # reads (train/test CSVs) and writes (the run log) further down.
+    if dataset is not None:
+        try:
+            ds_dir = _resolve_under(_DATASETS_DIR, dataset)
+        except ValueError as exc:
+            return {"status": "error", "stage": "input", "message": str(exc)}
+
     if data is None:
         if dataset is None:
             return {"status": "error", "stage": "input", "message": "Either 'data' (with 'y_test') or 'dataset' must be provided."}
         # Reject train-only (uploaded) datasets — no held-out test set exists.
-        test_path = _DATASETS_DIR / dataset / "protected" / "test.csv"
+        test_path = ds_dir / "protected" / "test.csv"
         if not test_path.exists():
             return {
                 "status": "error",
@@ -624,56 +793,11 @@ def fit_and_evaluate(
     if not re.search(r'\blog_lik\b', stan_code):
         return {"status": "error", "stage": "missing_log_lik", "message": "no 'log_lik' found in stan_code — required for NLPD computation"}
 
-    try:
-        model = _get_model(stan_code)
-    except Exception as exc:
-        return {"status": "error", "stage": "compilation", "message": _extract_compile_error(exc)}
-
-    run_id = _make_run_id()
-    run_dir = _RESULTS_DIR / "_runs" / run_id
-    samples_dir = run_dir / "samples"
-    samples_dir.mkdir(parents=True, exist_ok=True)
-    (run_dir / "model.stan").write_text(stan_code)
-
-    cfg = _merge_config(config)
-    t0 = time.time()
-    with _capture_logs() as log_buf:
-        try:
-            fit = model.sample(
-                data=data,
-                chains=cfg["chains"],
-                iter_warmup=cfg["iter_warmup"],
-                iter_sampling=cfg["iter_sampling"],
-                seed=cfg["seed"],
-                show_progress=False,
-                show_console=False,
-                output_dir=str(samples_dir),
-                timeout=cfg["max_runtime_sec"],
-            )
-        except TimeoutError:
-            (run_dir / "logs.txt").write_text(log_buf.getvalue())
-            # Returned as a normal error, not raised: the agent should learn
-            # "too slow, simplify" and keep iterating.
-            return {
-                "status": "error",
-                "stage": "sampling_timeout",
-                "message": (
-                    f"Sampling exceeded {cfg['max_runtime_sec']}s and was stopped. "
-                    "This usually means the posterior geometry is pathological "
-                    "(e.g. a latent GP over many points, or an unidentified "
-                    "scale parameter), not that the model is merely large. "
-                    "Try a lower-dimensional parameterisation — a basis "
-                    "expansion instead of a full GP, tighter priors on scales, "
-                    "or non-centred parameterisation."
-                ),
-                "run_id": run_id,
-                "runtime_sec": cfg["max_runtime_sec"],
-            }
-        except Exception as exc:
-            (run_dir / "logs.txt").write_text(log_buf.getvalue())
-            return {"status": "error", "stage": "sampling", "message": str(exc)[:500]}
-    (run_dir / "logs.txt").write_text(log_buf.getvalue())
-    runtime_sec = round(time.time() - t0, 1)
+    run = _compile_and_sample(stan_code, data, config)
+    if "error" in run:
+        return run["error"]
+    model, fit = run["model"], run["fit"]
+    run_id, run_dir, runtime_sec = run["run_id"], run["run_dir"], run["runtime_sec"]
 
     all_vars = fit.stan_variables()
     if "log_lik" not in all_vars:
@@ -689,21 +813,12 @@ def fit_and_evaluate(
 
     nlpd = _compute_nlpd(log_lik)
 
-    try:
-        diag = _make_diagnostics(fit)
-    except Exception:
-        diag = {"n_divergences": -1, "r_hat_max": float("nan"), "ess_bulk_min": -1}
-
-    try:
-        param_summary = _make_param_summary(fit)
-    except Exception:
-        param_summary = {}
+    diag, param_summary = _safe_fit_summaries(fit)
 
     # ── Diagnostics validity gate ──────────────────────────────────────────────
     # A result is only valid when all diagnostics are finite/non-sentinel and
     # NLPD itself is finite.  An invalid result must never be accepted as a
     # best-model improvement by the calling loop.
-    import math
     _diag_reasons: list[str] = []
     if not math.isfinite(nlpd):
         _diag_reasons.append(f"nlpd is not finite ({nlpd})")
@@ -768,7 +883,7 @@ def fit_and_evaluate(
     _free_gb = shutil.disk_usage(str(_RESULTS_DIR)).free / 2**30
     if _free_gb < 10:
         logging.warning("skipping shadow pass: only %.1f GB free", _free_gb)
-    elif dataset is not None and (_DATASETS_DIR / dataset / "protected" / "shadow.csv").exists():
+    elif dataset is not None and (ds_dir / "protected" / "shadow.csv").exists():
         try:
             shadow_data, _ = _load_dataset(dataset, test_file="shadow.csv")
             with tempfile.TemporaryDirectory(prefix="shadow_gq_") as gq_dir:
@@ -835,80 +950,24 @@ def sample(
     under --results-dir and are directly accessible when that directory is
     mounted via SSHFS on the client.
     """
-    try:
-        model = _get_model(stan_code)
-    except Exception as exc:
-        return {"status": "error", "stage": "compilation", "message": _extract_compile_error(exc)}
+    run = _compile_and_sample(stan_code, data, config)
+    if "error" in run:
+        return run["error"]
+    fit, cfg, run_dir = run["fit"], run["cfg"], run["run_dir"]
 
-    run_id = _make_run_id()
-    run_dir = _RESULTS_DIR / "_runs" / run_id
-    samples_dir = run_dir / "samples"
-    samples_dir.mkdir(parents=True, exist_ok=True)
-    (run_dir / "model.stan").write_text(stan_code)
+    diag, param_summary = _safe_fit_summaries(fit)
 
-    cfg = _merge_config(config)
-    t0 = time.time()
-    with _capture_logs() as log_buf:
-        try:
-            fit = model.sample(
-                data=data,
-                chains=cfg["chains"],
-                iter_warmup=cfg["iter_warmup"],
-                iter_sampling=cfg["iter_sampling"],
-                seed=cfg["seed"],
-                show_progress=False,
-                show_console=False,
-                output_dir=str(samples_dir),
-                timeout=cfg["max_runtime_sec"],
-            )
-        except TimeoutError:
-            (run_dir / "logs.txt").write_text(log_buf.getvalue())
-            # Returned as a normal error, not raised: the agent should learn
-            # "too slow, simplify" and keep iterating.
-            return {
-                "status": "error",
-                "stage": "sampling_timeout",
-                "message": (
-                    f"Sampling exceeded {cfg['max_runtime_sec']}s and was stopped. "
-                    "This usually means the posterior geometry is pathological "
-                    "(e.g. a latent GP over many points, or an unidentified "
-                    "scale parameter), not that the model is merely large. "
-                    "Try a lower-dimensional parameterisation — a basis "
-                    "expansion instead of a full GP, tighter priors on scales, "
-                    "or non-centred parameterisation."
-                ),
-                "run_id": run_id,
-                "runtime_sec": cfg["max_runtime_sec"],
-            }
-        except Exception as exc:
-            (run_dir / "logs.txt").write_text(log_buf.getvalue())
-            return {"status": "error", "stage": "sampling", "message": str(exc)[:500]}
-    (run_dir / "logs.txt").write_text(log_buf.getvalue())
-    runtime_sec = round(time.time() - t0, 1)
-
-    try:
-        diag = _make_diagnostics(fit)
-    except Exception:
-        diag = {"n_divergences": -1, "r_hat_max": float("nan"), "ess_bulk_min": -1}
-
-    try:
-        param_summary = _make_param_summary(fit)
-    except Exception:
-        param_summary = {}
-
-    result: dict = {
+    return {
         "status": "ok",
-        "run_id": run_id,
+        "run_id": run["run_id"],
         "n_samples": cfg["chains"] * cfg["iter_sampling"],
-        "runtime_sec": runtime_sec,
+        "runtime_sec": run["runtime_sec"],
         "diagnostics": diag,
         "param_summary": param_summary,
         "data_keys_loaded": sorted(data.keys()),
         "logs_path":    str(run_dir / "logs.txt"),
         "samples_path": str(run_dir),
     }
-
-    return result
 
 
 # ── Tool: get_data_summary ─────────────────────────────────────────────────────
@@ -930,7 +989,10 @@ def get_data_summary(dataset: str) -> dict:
     Also check that dataset_md contains a ## Data Interface Stan block;
     without it no CSV columns will be loaded during sampling.
     """
-    ds_dir     = _DATASETS_DIR / dataset
+    try:
+        ds_dir = _resolve_under(_DATASETS_DIR, dataset)
+    except ValueError as exc:
+        return {"status": "error", "message": str(exc)}
     train_path = ds_dir / "train.csv"
     md_path    = ds_dir / "dataset.md"
     test_path  = ds_dir / "protected" / "test.csv"
@@ -982,10 +1044,10 @@ def get_upload_instructions() -> dict:
     variables (e.g. `vector[N_train] x_train;`).  Without this block no CSV
     columns will be loaded and sampling will silently use an empty data dict.
 
-    IMPORTANT — N and N_test are never injected automatically from the CSV.
-    Declare them in the Stan `data` block and supply their values explicitly
-    via the `data` parameter of `fit_and_evaluate`
-    (e.g. `data={"N": 80, "N_test": 20}`).
+    N_train and N_test ARE injected automatically from the CSV row counts when
+    a dataset is loaded by name (same as for pre-staged datasets).  Only pass
+    the `data` parameter to override them or to supply additional scalars the
+    CSV does not provide.
     """
     if not _UPLOAD_PORT:
         return {
@@ -1033,7 +1095,6 @@ def list_datasets() -> dict:
     Dataset names for benchmarks are relative paths from --datasets-dir,
     e.g. 'benchmarks/regression_1d'. Pass this full name to fit_and_evaluate.
     """
-    benchmarks_dir = _DATASETS_DIR / "benchmarks"
     top_level = sorted(
         str(p.parent.relative_to(_DATASETS_DIR))
         for p in _DATASETS_DIR.glob("**/train.csv")
@@ -1065,7 +1126,10 @@ def get_run_history(dataset: str) -> dict:
     """
     # Scrubbed, not raw: log entries carry shadow_nlpd, which the agent must
     # never see (see _scrub_shadow).  The feedback `nlpd` survives untouched.
-    entries = [_scrub_shadow(e) for e in _read_log(dataset)]
+    try:
+        entries = [_scrub_shadow(e) for e in _read_log(dataset)]
+    except ValueError as exc:  # path traversal in the dataset name
+        return {"status": "error", "message": str(exc)}
     if not entries:
         return {"dataset": dataset, "n_entries": 0, "best_nlpd": None, "entries": []}
     nlpds = [e["nlpd"] for e in entries if "nlpd" in e]
@@ -1079,6 +1143,25 @@ def get_run_history(dataset: str) -> dict:
 
 # ── Tool: get_capabilities ────────────────────────────────────────────────────
 
+def _registered_tool_names() -> list[str]:
+    """Tool names currently registered with FastMCP.
+
+    Derived from the live registry — never a hand-maintained list — so a tool
+    withheld at startup (get_run_history without --include-run-history) is not
+    advertised here.  Incident 1's lesson (TOOL_POLICY.md) applies to tool
+    listings too: naming a withheld tool teaches the model it exists.
+    """
+    names: list[str] = []
+
+    def _collect() -> None:  # list_tools is async; run it on a private loop
+        names.extend(t.name for t in asyncio.run(mcp.list_tools(run_middleware=False)))
+
+    t = threading.Thread(target=_collect)
+    t.start()
+    t.join()
+    return sorted(names)
+
+
 @mcp.tool()
 def get_capabilities() -> dict:
     """Return server capabilities, available tools, and current configuration.
@@ -1090,16 +1173,8 @@ def get_capabilities() -> dict:
     upload_url = f"{base_url}/dataset/{{name}}" if base_url else "disabled"
     return {
         "server": "stan-mcp-server",
-        "tools": [
-            "get_capabilities",
-            "list_datasets",
-            "get_data_summary",
-            "check_model",
-            "fit_and_evaluate",
-            "sample",
-            "get_upload_instructions",
-            "get_run_history",
-        ],
+        "version": _VERSION,
+        "tools": _registered_tool_names(),
         "default_sampling_config": _DEFAULT_CONFIG,
         "log_lik_contract": (
             "Every model used with fit_and_evaluate must declare "
@@ -1177,7 +1252,7 @@ def main() -> None:
         mcp.run(transport="stdio")
         return
 
-    print(f"Stan MCP Server starting on http://{args.host}:{args.port}/mcp")
+    print(f"Stan MCP Server {_VERSION} starting on http://{args.host}:{args.port}/mcp")
     print(f"  datasets : {_DATASETS_DIR}")
     print(f"  results  : {_RESULTS_DIR}")
     print(f"  cache    : {_MODEL_CACHE}")
@@ -1223,5 +1298,4 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    print("Starting Stan MCP Server (Version 2026/4/26 13:09)...")
     main()

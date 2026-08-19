@@ -1,0 +1,23 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  fast-tests:
+    # Helper unit tests + shadow-leak regression tests. The end-to-end fit
+    # (test_fit_and_evaluate_runs_shadow_but_does_not_return_it) needs a
+    # compiled CmdStan and is deselected here; run it locally with
+    #   python test_shadow_isolation.py --with-fit
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install package
+        run: pip install -e .[dev]
+      - name: Run tests (no CmdStan)
+        run: pytest test_helpers.py test_shadow_isolation.py -k "not runs_shadow" -q
