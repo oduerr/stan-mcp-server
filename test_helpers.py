@@ -193,3 +193,69 @@ def test_capabilities_never_advertise_a_withheld_tool():
     finally:
         srv.mcp.tool()(srv.get_run_history)  # re-register for other tests
     assert "get_run_history" in srv._registered_tool_names()
+
+
+# ── GET /train sidecar endpoint (train data out, protected/ unreachable) ────────
+
+from fastapi.testclient import TestClient  # noqa: E402
+
+
+@pytest.fixture()
+def train_client(tmp_path, monkeypatch):
+    ds = tmp_path / "benchmarks" / "reg1"
+    (ds / "protected").mkdir(parents=True)
+    (ds / "train.csv").write_text("x,y\n1,2\n")
+    (ds / "dataset.md").write_text("# reg1\n")
+    (ds / "protected" / "test.csv").write_text("x,y\n9,9\n")
+    monkeypatch.setattr(srv, "_DATASETS_DIR", tmp_path)
+    return TestClient(srv._upload_app)
+
+
+def test_get_train_serves_train_csv_and_md(train_client):
+    r = train_client.get("/train/benchmarks/reg1")
+    assert r.status_code == 200
+    assert r.text == "x,y\n1,2\n"
+    r = train_client.get("/train/benchmarks/reg1", params={"file": "dataset.md"})
+    assert r.status_code == 200
+    assert r.text == "# reg1\n"
+
+
+def test_get_train_refuses_everything_else(train_client):
+    # Filename outside the whitelist — the only two servable files are fixed.
+    r = train_client.get("/train/benchmarks/reg1", params={"file": "protected/test.csv"})
+    assert r.status_code == 400
+    r = train_client.get("/train/benchmarks/reg1", params={"file": "../reg1/protected/test.csv"})
+    assert r.status_code == 400
+    # 'protected' as part of the DATASET name — inside the datasets dir, so the
+    # traversal check passes; the belt-and-braces parts guard must refuse it.
+    r = train_client.get("/train/benchmarks/reg1/protected")
+    assert r.status_code == 403
+    # Unknown dataset.
+    r = train_client.get("/train/benchmarks/nope")
+    assert r.status_code == 404
+    # No response body anywhere may carry the held-out values.
+    for resp in [
+        train_client.get("/train/benchmarks/reg1", params={"file": "protected/test.csv"}),
+        train_client.get("/train/benchmarks/reg1/protected"),
+    ]:
+        assert "9,9" not in resp.text
+
+
+def test_train_url_advertised(tmp_path, monkeypatch):
+    ds = tmp_path / "benchmarks" / "reg1"
+    ds.mkdir(parents=True)
+    (ds / "train.csv").write_text("x,y\n1,2\n")
+    monkeypatch.setattr(srv, "_DATASETS_DIR", tmp_path)
+    monkeypatch.setattr(srv, "_UPLOAD_PORT", 8766)
+    monkeypatch.setattr(srv, "_UPLOAD_HOST", "127.0.0.1")
+
+    caps = srv.get_capabilities()
+    assert caps["train_download_url"] == "http://127.0.0.1:8766/train/{dataset}"
+
+    summary = srv.get_data_summary("benchmarks/reg1")
+    assert summary["train_url"] == "http://127.0.0.1:8766/train/benchmarks/reg1"
+
+    # With the sidecar disabled, no URL is advertised.
+    monkeypatch.setattr(srv, "_UPLOAD_PORT", 0)
+    assert srv.get_capabilities()["train_download_url"] == "disabled"
+    assert "train_url" not in srv.get_data_summary("benchmarks/reg1")

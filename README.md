@@ -170,6 +170,25 @@ stan-mcp-server --datasets-dir ... --results-dir ... --upload-port 0
 Uploaded datasets are stored under `<datasets-dir>/_uploaded/` on the server.
 Dataset names may only contain letters, digits, underscores, and hyphens.
 
+## Downloading training data
+
+The sidecar also serves training data **out**, so clients that run code
+locally (a coding agent, the benchmark loop) can do EDA on the raw train set
+without the CSV ever entering LLM context — fetch to disk, compute aggregates
+there:
+
+```bash
+curl -o train.csv   http://127.0.0.1:8766/train/benchmarks/regression_1d
+curl -o dataset.md "http://127.0.0.1:8766/train/benchmarks/regression_1d?file=dataset.md"
+```
+
+The endpoint serves **only** `train.csv` and `dataset.md` — the filename is
+whitelisted, dataset names are traversal-checked, and anything under
+`protected/` is refused outright, so held-out test and shadow labels stay
+unreachable over HTTP (see [TOOL_POLICY.md](TOOL_POLICY.md)).  The URL is
+advertised as `train_download_url` in `get_capabilities` and per-dataset as
+`train_url` in `get_data_summary`.
+
 ## Dataset layout
 
 Datasets live under `--datasets-dir` in two areas:
