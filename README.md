@@ -1,5 +1,7 @@
 # Stan MCP Server
 
+<img src="assets/logo/stan-mcp-server.svg" width="110" align="right" alt="stan-mcp-server — plug in, and the chains stream out">
+
 This is an MCP server for the [Stan](https://mc-stan.org) language. It takes
 a [Stan model](https://mc-stan.org/docs/stan-users-guide/) as input and does
 the sampling (MCMC via CmdStan). It returns the diagnostics of the sampling
