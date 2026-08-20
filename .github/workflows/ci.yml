@@ -20,4 +20,4 @@ jobs:
       - name: Install package
         run: pip install -e .[dev]
       - name: Run tests (no CmdStan)
-        run: pytest test_helpers.py test_shadow_isolation.py -k "not runs_shadow" -q
+        run: pytest test_helpers.py test_shadow_isolation.py tests/use_cases -k "not runs_shadow" -q

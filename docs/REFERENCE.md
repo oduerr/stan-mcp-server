@@ -69,7 +69,7 @@ to load the draws.
 | `get_data_summary`        | Compact EDA for a named dataset: per-column stats (categorical columns summarized by levels), `tier`, `has_test`, `dataset_md`, `train_url` |
 | `check_model`             | Compile-only check (syntax + `log_lik` presence)                                                                                            |
 | `fit_and_evaluate`        | Sample + compute NLPD on the held-out test set; pre-staged datasets only                                                                    |
-| `sample`                  | Sample; returns scalar diagnostics + run asset paths                                                                                        |
+| `sample`                  | Sample; loads data by dataset name (incl. train-only uploaded datasets) and/or inline `data`; returns scalar diagnostics + run asset paths  |
 | `get_upload_instructions` | HTTP upload URL and field names for datasets                                                                                                |
 | `get_run_history`         | Logged NLPD history for a dataset — ⚠️ cross-session; withheld unless `--include-run-history`                                               |
 
