@@ -371,3 +371,34 @@ def test_code_tool_rejects_bad_run_id(code_ds):
     assert r["status"] == "error" and "Invalid run_id" in r["message"]
     r = _first(srv.run_python_code(code="print(1)", run_id="0123456789ab"))
     assert r["status"] == "error" and "No samples" in r["message"]
+
+
+# ── _diagnostic_flags (G3): pure logic, no CmdStan ─────────────────────────────
+
+def test_diagnostic_flags_quiet_on_healthy_run():
+    detail = {
+        "divergences_per_chain": [0, 0, 0, 0],
+        "max_treedepth_frac": 0.0, "max_treedepth_limit": 10,
+        "e_bfmi_per_chain": [0.9, 1.1, 0.95, 1.0],
+        "worst_r_hat": [{"param": "mu", "r_hat": 1.003}],
+        "lowest_ess_bulk": [{"param": "tau", "ess_bulk": 2500}],
+    }
+    assert srv._diagnostic_flags(detail, n_chains=4) == []
+
+
+def test_diagnostic_flags_fire_per_problem():
+    detail = {
+        "divergences_per_chain": [0, 7, 0, 0],
+        "max_treedepth_frac": 0.31, "max_treedepth_limit": 10,
+        "e_bfmi_per_chain": [0.15, 0.9, float("nan"), 1.0],
+        "worst_r_hat": [{"param": "tau", "r_hat": 1.08},
+                        {"param": "mu", "r_hat": 1.001}],
+        "lowest_ess_bulk": [{"param": "theta[3]", "ess_bulk": 42}],
+    }
+    flags = srv._diagnostic_flags(detail, n_chains=4)
+    assert len(flags) == 5
+    text = " ".join(flags)
+    assert "7 divergent" in text and "31% of draws" in text
+    assert "chain 1 (0.15)" in text and "chain 3" not in text   # nan not flagged
+    assert "tau (1.08)" in text and "mu (1.001)" not in text
+    assert "theta[3] (42)" in text

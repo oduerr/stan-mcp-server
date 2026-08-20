@@ -357,6 +357,113 @@ def _make_diagnostics(fit) -> dict:
     return {"n_divergences": n_divergences, "r_hat_max": r_hat_max, "ess_bulk_min": ess_bulk_min}
 
 
+def _make_diagnostics_detail(fit) -> dict:
+    """Consultation-grade sampler diagnostics (G3, docs/USE_CASES.md UC-4).
+
+    The three core scalars in _make_diagnostics answer "is this run valid";
+    this block answers "what went wrong where": per-chain divergences and
+    E-BFMI, treedepth saturation, step sizes, and the worst parameters by
+    R-hat / bulk ESS — the numbers behind advice like "the funnel is in tau,
+    go non-centred".
+    """
+    mv = fit.method_variables()
+    divergent = np.asarray(mv["divergent__"])          # (draws, chains)
+    treedepth = np.asarray(mv["treedepth__"])
+    energy    = np.asarray(mv["energy__"])
+    stepsize  = np.asarray(mv["stepsize__"])
+    n_draws, n_chains = divergent.shape
+
+    try:
+        max_depth = int(fit.metadata.cmdstan_config.get("max_depth", 10))
+    except Exception:
+        max_depth = 10
+    n_max_td = int(np.sum(treedepth >= max_depth))
+
+    e_bfmi = []
+    for c in range(n_chains):
+        e = energy[:, c]
+        var = float(np.var(e))
+        e_bfmi.append(round(float(np.mean(np.diff(e) ** 2)) / var, 3)
+                      if var > 0 else float("nan"))
+
+    detail: dict = {
+        "divergences_per_chain": [int(v) for v in divergent.sum(axis=0)],
+        "n_max_treedepth": n_max_td,
+        "max_treedepth_frac": round(n_max_td / divergent.size, 4),
+        "max_treedepth_limit": max_depth,
+        "e_bfmi_per_chain": e_bfmi,
+        "stepsize_per_chain": [round(float(s), 5) for s in stepsize.mean(axis=0)],
+    }
+
+    # Worst parameters by R-hat and bulk ESS (log_lik excluded, as everywhere).
+    summary = fit.summary()
+    filtered = summary[~summary.index.str.startswith("log_lik")]
+    r_hat_col = _find_col(filtered.columns, "R_hat", "R-hat", "Rhat")
+    ess_col   = _find_col(filtered.columns, "N_Eff", "ESS_bulk", "ess_bulk")
+    if r_hat_col:
+        worst = filtered[r_hat_col].dropna().sort_values(ascending=False)[:3]
+        detail["worst_r_hat"] = [
+            {"param": str(k), "r_hat": round(float(v), 4)} for k, v in worst.items()
+        ]
+    if ess_col:
+        low = filtered[ess_col].dropna().sort_values()[:3]
+        detail["lowest_ess_bulk"] = [
+            {"param": str(k), "ess_bulk": int(v)} for k, v in low.items()
+        ]
+
+    detail["flags"] = _diagnostic_flags(detail, n_chains)
+    return detail
+
+
+def _diagnostic_flags(detail: dict, n_chains: int) -> list[str]:
+    """Terse, factual warnings derived from the detail block (pure function)."""
+    flags: list[str] = []
+    div = detail.get("divergences_per_chain", [])
+    if sum(div) > 0:
+        flags.append(
+            f"{sum(div)} divergent transition(s) (per chain: {div}) — biased "
+            "exploration; consider a non-centred parameterisation or tighter priors"
+        )
+    frac = detail.get("max_treedepth_frac", 0)
+    if frac > 0.01:
+        flags.append(
+            f"{frac:.0%} of draws hit max treedepth "
+            f"({detail.get('max_treedepth_limit')}) — strong posterior "
+            "correlations or an unidentified scale; consider reparameterising"
+        )
+    low_bfmi = [
+        f"chain {i + 1} ({v})"
+        for i, v in enumerate(detail.get("e_bfmi_per_chain", []))
+        if math.isfinite(v) and v < 0.2
+    ]
+    if low_bfmi:
+        flags.append(
+            "low E-BFMI in " + ", ".join(low_bfmi) + " — energy transitions "
+            "too small (often a funnel or heavy tails); reparameterise"
+        )
+    bad_rhat = [
+        f"{d['param']} ({d['r_hat']})"
+        for d in detail.get("worst_r_hat", [])
+        if d["r_hat"] > 1.01
+    ]
+    if bad_rhat:
+        flags.append(
+            "R-hat above 1.01 for " + ", ".join(bad_rhat) + " — chains "
+            "disagree; run longer or reparameterise"
+        )
+    low_ess = [
+        f"{d['param']} ({d['ess_bulk']})"
+        for d in detail.get("lowest_ess_bulk", [])
+        if d["ess_bulk"] < 100 * n_chains
+    ]
+    if low_ess:
+        flags.append(
+            "bulk ESS below 100 per chain for " + ", ".join(low_ess) +
+            " — estimates are noisy; run longer or improve geometry"
+        )
+    return flags
+
+
 def _make_param_summary(fit) -> dict:
     result: dict = {}
     for name, draws in fit.stan_variables().items():
@@ -733,8 +840,8 @@ def _compile_and_sample(stan_code: str, data: dict, config: Optional[dict]) -> d
     }
 
 
-def _safe_fit_summaries(fit) -> tuple[dict, dict]:
-    """Diagnostics + parameter summary; degrade to sentinels rather than fail a run."""
+def _safe_fit_summaries(fit) -> tuple[dict, dict, dict]:
+    """Diagnostics + parameter summary + detail; degrade rather than fail a run."""
     try:
         diag = _make_diagnostics(fit)
     except Exception:
@@ -743,7 +850,11 @@ def _safe_fit_summaries(fit) -> tuple[dict, dict]:
         param_summary = _make_param_summary(fit)
     except Exception:
         param_summary = {}
-    return diag, param_summary
+    try:
+        detail = _make_diagnostics_detail(fit)
+    except Exception:
+        detail = {}
+    return diag, param_summary, detail
 
 
 # ── Tool: check_model ──────────────────────────────────────────────────────────
@@ -883,7 +994,7 @@ def fit_and_evaluate(
 
     nlpd = _compute_nlpd(log_lik)
 
-    diag, param_summary = _safe_fit_summaries(fit)
+    diag, param_summary, sampler_detail = _safe_fit_summaries(fit)
 
     # ── Diagnostics validity gate ──────────────────────────────────────────────
     # A result is only valid when all diagnostics are finite/non-sentinel and
@@ -911,6 +1022,7 @@ def fit_and_evaluate(
         "ess_bulk_min": diag["ess_bulk_min"],
         "runtime_sec": runtime_sec,
         "param_summary": param_summary,
+        "sampler_diagnostics": sampler_detail,
         "data_keys_loaded": sorted(data.keys()),
         "logs_path":    str(run_dir / "logs.txt"),
         "samples_path": str(run_dir),
@@ -1050,7 +1162,7 @@ def sample(
         return run["error"]
     fit, cfg, run_dir = run["fit"], run["cfg"], run["run_dir"]
 
-    diag, param_summary = _safe_fit_summaries(fit)
+    diag, param_summary, sampler_detail = _safe_fit_summaries(fit)
 
     return {
         "status": "ok",
@@ -1058,6 +1170,7 @@ def sample(
         "n_samples": cfg["chains"] * cfg["iter_sampling"],
         "runtime_sec": run["runtime_sec"],
         "diagnostics": diag,
+        "sampler_diagnostics": sampler_detail,
         "param_summary": param_summary,
         "data_keys_loaded": sorted(data.keys()),
         "logs_path":    str(run_dir / "logs.txt"),
