@@ -27,3 +27,5 @@ datasets/*
 *.swp
 /stan_test_datasets
 /results
+TOOL_POLICY.html
+TOOL_POLICY_files/

@@ -1,7 +1,6 @@
 # Reference
 
-The complete technical documentation for the Stan MCP Server. For a first
-start, read the [README](../README.md); for installation, read
+The complete technical documentation for the Stan MCP Server. For a first start, read the [README](../README.md); for installation, read
 [AGENTS.md](../AGENTS.md); for the leakage model and the permitted agent tool
 surface, [TOOL_POLICY.md](../TOOL_POLICY.md) is authoritative.
 
@@ -17,10 +16,12 @@ client ─────HTTP sidecar (port 8766)───────────�
 
 Two channels, deliberately separate:
 
-| Channel | Carries | Passes through LLM context? |
-|---|---|---|
-| MCP tools (port 8765) | compact JSON: NLPD, diagnostics, stats, URLs | yes |
+
+| Channel                  | Carries                                      | Passes through LLM context?   |
+| ------------------------ | -------------------------------------------- | ----------------------------- |
+| MCP tools (port 8765)    | compact JSON: NLPD, diagnostics, stats, URLs | yes                           |
 | HTTP sidecar (port 8766) | bulk bytes: dataset uploads, train downloads | no — client ↔ server directly |
+
 
 Held-out data (`protected/test.csv`, `protected/shadow.csv`) is reachable
 through neither channel.
@@ -48,28 +49,56 @@ Which of these a **benchmark agent** may be offered — and which leak — is
 specified in [TOOL_POLICY.md](../TOOL_POLICY.md). The table below is the full
 server surface, not the permitted agent surface.
 
-| Tool | Purpose |
-|------|---------|
-| `get_capabilities` | Tool list (from the live registry), server version and configuration, upload and train-download URLs |
-| `list_datasets` | List pre-staged and uploaded datasets |
-| `get_data_summary` | Compact EDA for a named dataset: per-column stats (categorical columns summarized by levels), `tier`, `has_test`, `dataset_md`, `train_url` |
-| `check_model` | Compile-only check (syntax + `log_lik` presence) |
-| `fit_and_evaluate` | Sample + compute NLPD on the held-out test set; pre-staged datasets only |
-| `sample` | Sample; returns scalar diagnostics + run asset paths |
-| `get_upload_instructions` | HTTP upload URL and field names for datasets |
-| `get_run_history` | Logged NLPD history for a dataset — ⚠️ cross-session; withheld unless `--include-run-history` |
+
+
+Where the table says **run asset paths**, it means the two fields
+`logs_path` (the CmdStan console log, a text file) and `samples_path` (the
+run directory holding `model.stan` plus one posterior-draw CSV per chain).
+Both lie under `--results-dir/_runs/<run_id>/`. The paths — not the
+contents — are returned, so the agent (or you) can open them on disk; see
+[Run assets](#run-assets--logs-and-posterior-draws) for the layout and how
+to load the draws.
+
+
+
+
+| Tool                      | Purpose                                                                                                                                     |
+| ------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------- |
+| `get_capabilities`        | Tool list (from the live registry), server version and configuration, upload and train-download URLs                                        |
+| `list_datasets`           | List pre-staged and uploaded datasets                                                                                                       |
+| `get_data_summary`        | Compact EDA for a named dataset: per-column stats (categorical columns summarized by levels), `tier`, `has_test`, `dataset_md`, `train_url` |
+| `check_model`             | Compile-only check (syntax + `log_lik` presence)                                                                                            |
+| `fit_and_evaluate`        | Sample + compute NLPD on the held-out test set; pre-staged datasets only                                                                    |
+| `sample`                  | Sample; returns scalar diagnostics + run asset paths                                                                                        |
+| `get_upload_instructions` | HTTP upload URL and field names for datasets                                                                                                |
+| `get_run_history`         | Logged NLPD history for a dataset — ⚠️ cross-session; withheld unless `--include-run-history`                                               |
+
 
 **Recommended call order:**
 `get_capabilities` → `list_datasets` → `get_data_summary` → `check_model` →
+
 - **Pre-staged dataset** (`tier: staged`): `fit_and_evaluate`
 - **Uploaded dataset** (`tier: uploaded`): `sample` → compute PSIS-LOO yourself
 
+
+
 ## HTTP sidecar endpoints
 
-| Endpoint | Direction | Carries |
-|---|---|---|
-| `POST /dataset/{name}` | in | train CSV + optional `dataset.md` (multipart) |
-| `GET /train/{dataset}` | out | `train.csv`, or `dataset.md` with `?file=dataset.md` — nothing else |
+Why a separate channel for bulk data? Three reasons. A CSV pasted into a
+conversation consumes context (and money) on something the model cannot use
+well — LLMs reason poorly over thousands of raw numbers, and a long context
+degrades everything that follows. The aggregates the tools return carry the
+information that actually drives modelling decisions at a fraction of the
+tokens. And for benchmark datasets it is a hard requirement, not an
+optimisation: held-out labels must never appear in the model's context, so
+bulk data needs a path that bypasses it entirely.
+
+
+| Endpoint               | Direction | Carries                                                             |
+| ---------------------- | --------- | ------------------------------------------------------------------- |
+| `POST /dataset/{name}` | in        | train CSV + optional `dataset.md` (multipart)                       |
+| `GET /train/{dataset}` | out       | `train.csv`, or `dataset.md` with `?file=dataset.md` — nothing else |
+
 
 `GET /train` exists so clients that execute code locally (a coding agent, an
 agent loop with a local EDA tool) can compute on the raw train set without the
@@ -90,11 +119,13 @@ containing `protected/` is refused. The URL is advertised as
 Defaults: 4 chains × 1000 warmup + 1000 sampling draws, seed 42. The caller
 can change these per call via `config`, within server-side caps:
 
-| Setting | Default | Cap |
-|---|---|---|
-| `chains` | 4 | 16 |
-| `iter_warmup` / `iter_sampling` | 1000 | 10 000 |
-| `max_runtime_sec` | 900 | can only be **lowered** by the caller |
+
+| Setting                         | Default | Cap                                   |
+| ------------------------------- | ------- | ------------------------------------- |
+| `chains`                        | 4       | 16                                    |
+| `iter_warmup` / `iter_sampling` | 1000    | 10 000                                |
+| `max_runtime_sec`               | 900     | can only be **lowered** by the caller |
+
 
 The wall-clock ceiling exists because a pathological posterior samples
 forever; a timeout is returned to the agent as a normal error
@@ -133,6 +164,8 @@ automatically deleted.
 
 ## Datasets
 
+
+
 ### Layout
 
 ```
@@ -154,10 +187,12 @@ e.g. `benchmarks/regression_1d` or `_uploaded/my_experiment`.
 
 ### Two-tier system
 
-| Tier | How created | `fit_and_evaluate` | Suggested evaluation |
-|------|-------------|---------------------|----------------------|
-| **staged** | Operator places `train.csv` + `protected/test.csv` | ✅ real held-out NLPD | `fit_and_evaluate` |
-| **uploaded** | Agent/user uploads via HTTP (train only) | ❌ blocked | `sample` + PSIS-LOO |
+
+| Tier         | How created                                        | `fit_and_evaluate`   | Suggested evaluation |
+| ------------ | -------------------------------------------------- | -------------------- | -------------------- |
+| **staged**   | Operator places `train.csv` + `protected/test.csv` | ✅ real held-out NLPD | `fit_and_evaluate`   |
+| **uploaded** | Agent/user uploads via HTTP (train only)           | ❌ blocked            | `sample` + PSIS-LOO  |
+
 
 `get_data_summary` returns `tier` and `has_test` so the agent knows which
 path to follow before writing any Stan code.
@@ -260,6 +295,8 @@ stan-mcp-server \
   --token $(openssl rand -hex 32)   # save this token
 ```
 
+
+
 ### 2. Tunnel the ports via SSH
 
 ```bash
@@ -293,6 +330,8 @@ the agent can read logs and samples directly.
 }
 ```
 
+
+
 ## Security
 
 For remote deployments (i.e. `--host 0.0.0.0`) protect the server with a
@@ -313,6 +352,8 @@ curl -X POST http://<server-ip>:8766/dataset/my_experiment \
      -H "Authorization: Bearer <token>" \
      -F train=@train.csv
 ```
+
+
 
 ## Leakage model
 

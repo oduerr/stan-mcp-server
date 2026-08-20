@@ -1,21 +1,27 @@
 # Stan MCP Server
 
-Give an LLM agent safe hands for Bayesian modelling. The agent writes
-[Stan](https://mc-stan.org) code; this server compiles it, runs MCMC
-(CmdStan), and answers with compact JSON — scores and convergence
-diagnostics, never raw sampler output. Data and posterior draws stay on disk
-and never enter the model's context.
+This is an MCP server for the [Stan](https://mc-stan.org) language. It takes
+a [Stan model](https://mc-stan.org/docs/stan-users-guide/) as input and does
+the sampling (MCMC via CmdStan). It returns the diagnostics of the sampling
+and, when the dataset has a held-out test set, the NLPD on it. It is designed
+to be used together with an LLM agent, like Claude Code, OpenCode, or a
+similar agent.
 
-**Two ways to use it:**
+**Ways to use it:**
 
-- **As a Stan assistant for your own work.** Upload your CSV, then let the
-  agent do what it is good at: write the first model, fix the compile errors,
-  explain the divergences, compare models with PSIS-LOO, tighten the priors —
-  while the server does the fitting and keeps bulk data out of the
-  conversation.
+- *(work in progress)* **As a Stan assistant for your own work.** Let the
+  agent upload your data, then write the model from your description. It does
+  the dirty work: fixes the compile errors, runs the sampling, and reports
+  the diagnostics. The workflows we are building toward are collected in
+  [docs/USE_CASES.md](docs/USE_CASES.md).
+
+- *(work in progress)* **As an improvement loop on your own data.** Starting
+  from that first model, iterate: check priors, compare variants with
+  PSIS-LOO, and keep what predicts better.
+
 - **As the evaluation server of the
-  [AutoStan](https://github.com/tidit-ch/autostan) loop**, where an agent
-  iterates against the NLPD on **held-out data it can never see**: propose a
+  [AutoStan](https://github.com/tidit-ch/autostan) project**, where an agent
+  iterates against the NLPD on **held-out data** it can never see: propose a
   model → fit → read the score → reason → propose a better one.
 
 ```
@@ -28,7 +34,7 @@ agent:  fit_and_evaluate(stan_code="…quartic mean + student_t…", …)
 server: {"nlpd": 1.17, …}          ← oracle for this dataset: 0.94
 ```
 
-## Choose your door
+## Next steps depending on...
 
 | You are… | Do this |
 |---|---|
