@@ -102,12 +102,22 @@ async def _run_checks(client: Client) -> None:
     assert n_divs == 0,        f"expected 0 divergences, got {n_divs}"
     assert r_hat < 1.1,        f"r_hat_max={r_hat} suspiciously high"
 
-    # ── 5. get_run_history ─────────────────────────────────────────────────────
-    print("\n[5] get_run_history(benchmarks/regression_1d) …")
-    r = (await client.call_tool("get_run_history", {"dataset": "benchmarks/regression_1d"})).data
-    assert "entries" in r, f"get_run_history failed: {r}"
-    assert r["n_entries"] >= 1, f"expected at least 1 entry, got {r['n_entries']}"
-    print(f"    n_entries={r['n_entries']}  best_nlpd={r['best_nlpd']}")
+    # ── 5. get_run_history — exercised only when the server exposes it ─────────
+    # Withheld by default since --include-run-history (see TOOL_POLICY.md);
+    # on a default server the correct behaviour is its ABSENCE.
+    served = {t.name for t in await client.list_tools()}
+    if "get_run_history" in served:
+        print("\n[5] get_run_history(benchmarks/regression_1d) …")
+        r = (await client.call_tool("get_run_history", {"dataset": "benchmarks/regression_1d"})).data
+        assert "entries" in r, f"get_run_history failed: {r}"
+        assert r["n_entries"] >= 1, f"expected at least 1 entry, got {r['n_entries']}"
+        print(f"    n_entries={r['n_entries']}  best_nlpd={r['best_nlpd']}")
+    else:
+        print("\n[5] get_run_history withheld (default) …")
+        caps = (await client.call_tool("get_capabilities", {})).data
+        assert "get_run_history" not in caps["tools"], \
+            "withheld tool must not be advertised by get_capabilities"
+        print("    correctly absent from tool list and capabilities")
 
     print("\nAll assertions passed.")
 
