@@ -71,8 +71,13 @@ Without `uv`: `python3 -m venv .venv && .venv/bin/pip install -e .`
 ## 4. Start the server
 
 ```bash
-.venv/bin/stan-mcp-server --datasets-dir datasets --results-dir results
+.venv/bin/stan-mcp-server --datasets-dir datasets --results-dir results \
+  --enable-code-tool
 ```
+
+`--enable-code-tool` exposes `run_python_code` — analysis code executed
+server-side with figures returned as images. Include it for assistant use;
+omit it for benchmark runs (see TOOL_POLICY.md).
 
 Run it in the background (or a separate terminal). The startup banner shows
 the version, both ports, and `history : get_run_history withheld (default)`.
@@ -164,10 +169,15 @@ your human brings a CSV:
    idata = az.from_cmdstan(sorted(glob.glob("<samples_path>/samples/*.csv")))
    print(az.loo(idata))
    ```
-4. Beyond scores, do what a good statistician does: read `logs_path` when a
+4. **Show, don't only tell** (needs `--enable-code-tool`): use
+   `run_python_code(dataset=…, run_id=…)` for prior/posterior predictive
+   plots, trace plots and `az.loo(idata)` — every saved .png comes back as an
+   image your human sees inline. `cols` (train columns) and `idata` (the
+   run's draws) are predefined.
+5. Beyond scores, do what a good statistician does: read `logs_path` when a
    fit misbehaves, explain divergences and R-hat in plain language, propose
    prior and likelihood changes one at a time, and say *why*.
-5. If your human wants honest held-out evaluation, tell them to place a test
+6. If your human wants honest held-out evaluation, tell them to place a test
    split at `<datasets-dir>/_uploaded/<name>/protected/test.csv` themselves —
    then `fit_and_evaluate` works and you must not look at that file.
 

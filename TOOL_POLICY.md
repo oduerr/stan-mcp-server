@@ -55,6 +55,7 @@ may be offered the tool — do not restate tool behaviour here.
 | `fit_and_evaluate`        | **NLPD on the held-out set**, diagnostics, `run_id`                                                   | **by design** — this is the feedback channel the benchmark measures | ✅ yes                            |
 | `get_upload_instructions` | HTTP upload URL and fields                                                                            | none                                                                | ✅ yes                            |
 | `get_run_history`         | **every logged iteration for the dataset, across all sessions and agents** — NLPDs, notes, rationales | **L2**                                                              | ❌ **no — must never be offered** |
+| `run_python_code`         | stdout + figures of agent-written Python executed **on the server host**                              | **L1** — see note below                                             | ❌ **no — withheld by default** (`--enable-code-tool`; assistant use only) |
 
 
 
@@ -89,7 +90,7 @@ or any code-execution tool) measure a different task than summary-stats-only
 runs.  The loop must record the capability in its run log (`eda_code_enabled`)
 so the two populations are never pooled silently.
 
-### Notes on the two sensitive entries
+### Notes on the sensitive entries
 
 `fit_and_evaluate` **returns the test NLPD, and that is intended.** The
 benchmark's premise is an agent iterating against held-out feedback; removing
@@ -102,6 +103,16 @@ appears in the tool response.
 made safe by filtering, because the histories of different runs on the same
 dataset are exactly what must stay separated. It remains available for
 interactive/human use, where cross-run context is a feature.
+
+`run_python_code` **executes agent-written code on the server host**, i.e. on
+a machine that also stores `protected/`. The containment (isolated subprocess
+in a working directory holding only the requested train.csv and run samples;
+wall-clock limit; capped stdout) stops honest agents — there is a test
+asserting the working directory never contains protected data — but it is not
+an OS-level sandbox: adversarial code can still open absolute paths. Hence:
+withheld by default, enabled explicitly with `--enable-code-tool` for
+assistant use, and never offered in benchmark runs unless the server host has
+OS-level isolation from `protected/`.
 
 ---
 

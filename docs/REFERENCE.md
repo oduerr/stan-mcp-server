@@ -43,6 +43,29 @@ stan-mcp-server \
 (default: withheld). It returns cross-session results and must never be
 offered to benchmark agents — see [TOOL_POLICY.md](../TOOL_POLICY.md).
 
+`--enable-code-tool` additionally exposes `run_python_code` (default:
+withheld) — the tool behind prior/posterior predictive plots, trace plots and
+PSIS-LOO in clients that cannot execute code themselves (Claude Desktop).
+Assistant use only; see [TOOL_POLICY.md](../TOOL_POLICY.md).
+
+## The code tool (`run_python_code`)
+
+With `--enable-code-tool`, the agent can send Python that the server executes
+in an isolated subprocess and answer with capped stdout **plus every saved
+.png as an MCP image** (rendered inline by Claude Desktop / Claude Code; up
+to 4 per call, 60 s default / 120 s max wall clock). Preloaded names:
+
+- `dataset="…"` → `cols`: dict of train.csv columns as numpy arrays (train
+  data only — the working directory never contains `protected/`).
+- `run_id="…"` → `idata`: that run's posterior draws as an arviz
+  `InferenceData` (plus the run's `model.stan` beside it).
+
+numpy, matplotlib (Agg) and arviz are available. Typical calls: EDA
+aggregates, `az.plot_ppc`, `az.plot_trace`, `az.loo(idata)`, prior-predictive
+envelopes. Errors return the traceback so the agent can fix its code and
+retry. Leakage analysis and the benchmark prohibition:
+[TOOL_POLICY.md](../TOOL_POLICY.md).
+
 ## MCP tools
 
 Which of these a **benchmark agent** may be offered — and which leak — is
@@ -72,6 +95,7 @@ to load the draws.
 | `sample`                  | Sample; loads data by dataset name (incl. train-only uploaded datasets) and/or inline `data`; returns scalar diagnostics + run asset paths  |
 | `get_upload_instructions` | HTTP upload URL and field names for datasets                                                                                                |
 | `get_run_history`         | Logged NLPD history for a dataset — ⚠️ cross-session; withheld unless `--include-run-history`                                               |
+| `run_python_code`         | Execute analysis code server-side with `cols` (train columns) and/or `idata` (a run's draws) preloaded; figures return as MCP images — ⚠️ withheld unless `--enable-code-tool` |
 
 
 **Recommended call order:**

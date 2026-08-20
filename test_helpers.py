@@ -299,3 +299,75 @@ def test_sample_input_stage_errors(tmp_path, monkeypatch):
     assert r["status"] == "error" and r["stage"] == "data_loading"
     r = srv.sample(stan_code="model {}", dataset="nope")
     assert r["status"] == "error" and "not found" in r["message"]
+
+
+# ── run_python_code (G2): contained execution, figures as images ───────────────
+
+@pytest.fixture()
+def code_ds(tmp_path, monkeypatch):
+    ds = tmp_path / "benchmarks" / "reg1"
+    (ds / "protected").mkdir(parents=True)
+    (ds / "train.csv").write_text("x,y\n1.0,2.0\n2.0,4.0\n3.0,6.0\n")
+    (ds / "protected" / "test.csv").write_text("x,y\n9.0,-7.654321\n")
+    monkeypatch.setattr(srv, "_DATASETS_DIR", tmp_path)
+    monkeypatch.setattr(srv, "_RESULTS_DIR", tmp_path / "results")
+    return ds
+
+
+def _first(result):
+    return result[0] if isinstance(result, list) else result
+
+
+def test_code_tool_requires_dataset_or_run_id(code_ds):
+    r = _first(srv.run_python_code(code="print(1)"))
+    assert r["status"] == "error" and r["stage"] == "input"
+
+
+def test_code_tool_cols_and_stdout(code_ds):
+    r = srv.run_python_code(code="print(sorted(cols)); print(float(cols['y'].mean()))",
+                            dataset="benchmarks/reg1")
+    assert _first(r)["status"] == "ok", r
+    assert "['x', 'y']" in _first(r)["stdout"] and "4.0" in _first(r)["stdout"]
+
+
+def test_code_tool_error_returns_traceback(code_ds):
+    r = _first(srv.run_python_code(code="cols['nope']", dataset="benchmarks/reg1"))
+    assert r["status"] == "error" and "nope" in r["stderr"]
+
+
+def test_code_tool_figures_come_back_as_images(code_ds):
+    from fastmcp.utilities.types import Image
+    r = srv.run_python_code(
+        code=("import matplotlib.pyplot as plt\n"
+              "plt.plot(cols['x'], cols['y'])\nplt.savefig('fit.png')\nprint('done')"),
+        dataset="benchmarks/reg1",
+    )
+    assert isinstance(r, list) and _first(r)["figures"] == ["fit.png"]
+    assert isinstance(r[1], Image)
+
+
+def test_code_tool_timeout_and_caps(code_ds):
+    r = _first(srv.run_python_code(code="import time\ntime.sleep(30)",
+                                   dataset="benchmarks/reg1", timeout_sec=2))
+    assert r["status"] == "error" and r["stage"] == "timeout"
+    r = _first(srv.run_python_code(code="print('x' * 50000)", dataset="benchmarks/reg1"))
+    assert len(r["stdout"]) <= srv._CODE_STDOUT_CAP and "truncated" in r["note"]
+
+
+def test_code_tool_workdir_contains_only_requested_files(code_ds):
+    # The containment boundary we can enforce: nothing but train.csv (and the
+    # runner) is visible from the working directory — protected/ is not there.
+    r = _first(srv.run_python_code(
+        code="import os; print(sorted(os.listdir('.'))); print(os.path.exists('protected'))",
+        dataset="benchmarks/reg1"))
+    assert "['runner.py', 'train.csv']" in r["stdout"]
+    assert "False" in r["stdout"]
+    # And the held-out sentinel value never appears in any response field.
+    assert "-7.654321" not in str(r)
+
+
+def test_code_tool_rejects_bad_run_id(code_ds):
+    r = _first(srv.run_python_code(code="print(1)", run_id="../../etc"))
+    assert r["status"] == "error" and "Invalid run_id" in r["message"]
+    r = _first(srv.run_python_code(code="print(1)", run_id="0123456789ab"))
+    assert r["status"] == "error" and "No samples" in r["message"]

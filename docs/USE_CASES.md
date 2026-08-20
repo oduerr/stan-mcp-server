@@ -38,10 +38,10 @@ Agent: writes the model with priors only (no likelihood statement), `sample`
 → simulated `y_rep` draws land on disk → plots simulated-vs-observed and
 shows the figure.
 
-**Verdict: ⚠️** — the simulation is a pure convention (documented in
-[AGENTS.md](../AGENTS.md)); the *showing* works only in clients
-that can execute local plotting code (Claude Code). In Claude Desktop there
-is no image. **Gap G2.**
+**Verdict: ✅** (server started with `--enable-code-tool`) — priors-only
+model → `sample` → `run_python_code(run_id=…, dataset=…)` plots simulated vs
+observed and the figure returns as an MCP image, in every client. Enforced by
+`tests/use_cases/test_uc02_prior_predictive.py`.
 
 ## UC-3 · Prior choice iteration
 
@@ -51,8 +51,8 @@ is no image. **Gap G2.**
 Agent: adjusts priors → repeats UC-2 → shows before/after side by side and
 explains the reasoning.
 
-**Verdict: ⚠️** — same dependencies as UC-2. The iteration itself is cheap
-(compile cache makes refits fast). **Gap G2.**
+**Verdict: ✅** — repeat UC-2 with adjusted priors; refits are cheap
+(compile cache), and before/after figures come back side by side.
 
 ## UC-4 · Fit and "did all go well?"
 
@@ -74,8 +74,8 @@ non-centred". **Gap G3.**
 Agent: model emits `y_rep` in generated quantities → draws are on disk →
 overlay density / test-statistic plots → shown and interpreted.
 
-**Verdict: ⚠️** — same shape as UC-2: computation possible, visualization
-client-dependent. **Gap G2.**
+**Verdict: ✅** — `y_rep` in generated quantities → `run_python_code` with
+`az.plot_ppc` (or a hand-rolled overlay); image in every client.
 
 ## UC-6 · Model comparison
 
@@ -85,8 +85,8 @@ Agent: fits both with `log_lik` on the *training* data → computes PSIS-LOO
 (`az.loo`) from the on-disk draws → reports elpd difference ± SE and the
 Pareto-k health check.
 
-**Verdict: ⚠️** — works today in coding agents (documented in AGENTS.md
-step 7); no path in Claude Desktop. **Gap G2** (LOO is just analysis code).
+**Verdict: ✅** — coding agents compute LOO locally (AGENTS.md step 7);
+every other client via `run_python_code(run_id=…)` with `az.loo(idata)`.
 
 ## UC-7 · Hierarchical model on grouped data
 
@@ -97,9 +97,9 @@ Agent: declares a group column via the Data Interface (`J`, 1-based ids) →
 per-group summaries to justify pooling → centred vs non-centred as
 diagnostics demand (UC-4) → compares against complete pooling (UC-6).
 
-**Verdict: ⚠️** — everything composes from UC-1/4/6; inherits their gaps.
-The `J` handling (max id, 1-based validation) is already server-side.
-**Gaps G2, G3.**
+**Verdict: ⚠️** — composes from UC-1/4/6; what remains missing is the
+consultation-grade diagnostics for the centred/non-centred decision.
+**Gap G3.**
 
 ## UC-8 · Predict for new inputs
 
@@ -134,6 +134,6 @@ flip and a test under `tests/use_cases/` enforces them.
 | Gap | What | Unblocks | Status |
 |---|---|---|---|
 | **G1** | `sample(dataset=…)` — load uploaded/staged data by name instead of inline through context | UC-1, 2, 3, 7 | **closed** (2026-08-20) — incl. merge contract for `data` in both fit tools |
-| **G2** | `run_python_code(code, dataset=…, run_id=…)` — contained server-side execution with train columns and/or the run's draws preloaded, figures returned as MCP **image content** (works in every client, incl. Claude Desktop) | UC-2, 3, 5, 6, 7 | open — design discussed; must be flag-gated, TOOL_POLICY row, leak-probe test |
+| **G2** | `run_python_code(code, dataset=…, run_id=…)` — contained server-side execution with train columns and/or the run's draws preloaded, figures returned as MCP **image content** (works in every client, incl. Claude Desktop) | UC-2, 3, 5, 6, 7 | **closed** (2026-08-20) — flag-gated (`--enable-code-tool`), TOOL_POLICY row, containment test |
 | **G3** | Consultation-grade diagnostics: E-BFMI, treedepth saturation, per-parameter worst R-hat/ESS, divergences per chain | UC-4, 7 | open |
 | **G4** | Standalone generated-quantities pass over an existing fit (reuse the shadow-pass machinery) | UC-8 | open — low priority |

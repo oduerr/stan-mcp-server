@@ -1299,6 +1299,159 @@ def get_capabilities() -> dict:
     }
 
 
+# ── Tool: run_python_code (assistant tier — withheld unless --enable-code-tool)
+
+_CODE_TIMEOUT_DEFAULT = 60
+_CODE_TIMEOUT_CAP     = 120
+_CODE_STDOUT_CAP      = 8000
+_CODE_STDERR_CAP      = 2000
+_CODE_MAX_FIGURES     = 4
+_RUN_ID_RE = re.compile(r"[0-9a-f]{12}")
+
+# The subprocess runs this preamble, then the agent's code at module level.
+# `cols` (train columns as numpy arrays) and/or `idata` (the run's draws as
+# an arviz InferenceData) are predefined depending on what was requested.
+_CODE_RUNNER_PREAMBLE = '''\
+import glob
+import os
+import numpy as np
+try:
+    import matplotlib
+    matplotlib.use("Agg")   # headless: savefig works, no display needed
+except ImportError:
+    pass
+
+
+def _load_cols(path):
+    import csv
+    with open(path, newline="") as f:
+        rows = list(csv.DictReader(f))
+    out = {}
+    for k in rows[0]:
+        vals = [r[k] for r in rows]
+        try:
+            out[k] = np.array([float(v) for v in vals])
+        except ValueError:
+            out[k] = np.array(vals, dtype=object)
+    return out
+
+
+cols = _load_cols("train.csv") if os.path.exists("train.csv") else None
+if os.path.isdir("samples"):
+    import arviz as az
+    idata = az.from_cmdstan(sorted(glob.glob("samples/*.csv")))
+else:
+    idata = None
+
+# ── agent-written code below ──────────────────────────────────────────────────
+'''
+
+
+@mcp.tool()
+def run_python_code(
+    code: str,
+    dataset: Optional[str] = None,
+    run_id: Optional[str] = None,
+    timeout_sec: int = _CODE_TIMEOUT_DEFAULT,
+):
+    """Execute Python analysis code on the server; figures come back as images.
+
+    Preloaded names, depending on what you request:
+
+    - `dataset` → `cols`: dict mapping each train.csv column to a numpy 1-D
+      array (TRAIN data only — never test data).
+    - `run_id` → `idata`: the run's posterior draws as an arviz
+      InferenceData (from a previous `sample` / `fit_and_evaluate` call).
+
+    numpy, matplotlib (Agg) and arviz are available.  print() the aggregates
+    you want to see — stdout is capped at 8 kB.  Every figure you save as
+    .png in the working directory (or via plt.savefig) is returned as an
+    image, up to 4 per call.  Never print raw data rows.
+
+    Typical uses: EDA on the train columns, prior/posterior predictive plots
+    (az.plot_ppc), trace plots (az.plot_trace), PSIS-LOO (az.loo(idata)).
+
+    The code runs in an isolated working directory containing only the
+    requested files, with a wall-clock limit (default 60 s, max 120 s).
+    Errors return the traceback so you can fix the code and retry.
+    """
+    import shutil  # noqa: PLC0415
+
+    if dataset is None and run_id is None:
+        return {"status": "error", "stage": "input",
+                "message": "Provide 'dataset' (for train columns) and/or 'run_id' (for posterior draws)."}
+    try:
+        timeout = max(1, min(int(timeout_sec), _CODE_TIMEOUT_CAP))
+    except (TypeError, ValueError):
+        timeout = _CODE_TIMEOUT_DEFAULT
+
+    with tempfile.TemporaryDirectory(prefix="stan_mcp_code_") as tmp:
+        tmpdir = Path(tmp)
+
+        if dataset is not None:
+            try:
+                ds_dir = _resolve_under(_DATASETS_DIR, dataset)
+            except ValueError as exc:
+                return {"status": "error", "stage": "input", "message": str(exc)}
+            train = ds_dir / "train.csv"
+            if not train.exists():
+                return {"status": "error", "stage": "input",
+                        "message": f"Dataset '{dataset}' not found (no train.csv)."}
+            shutil.copy(train, tmpdir / "train.csv")
+
+        if run_id is not None:
+            if not _RUN_ID_RE.fullmatch(str(run_id)):
+                return {"status": "error", "stage": "input",
+                        "message": f"Invalid run_id '{run_id}'."}
+            samples_src = _RESULTS_DIR / "_runs" / run_id / "samples"
+            csvs = sorted(samples_src.glob("*.csv")) if samples_src.is_dir() else []
+            if not csvs:
+                return {"status": "error", "stage": "input",
+                        "message": f"No samples found for run_id '{run_id}'."}
+            (tmpdir / "samples").mkdir()
+            for f in csvs:
+                shutil.copy(f, tmpdir / "samples" / f.name)
+            model_stan = _RESULTS_DIR / "_runs" / run_id / "model.stan"
+            if model_stan.exists():
+                shutil.copy(model_stan, tmpdir / "model.stan")
+
+        (tmpdir / "runner.py").write_text(_CODE_RUNNER_PREAMBLE + code + "\n")
+        import subprocess  # noqa: PLC0415
+        import sys  # noqa: PLC0415
+        try:
+            proc = subprocess.run(
+                [sys.executable, "-I", "runner.py"],
+                cwd=tmpdir, capture_output=True, text=True, timeout=timeout,
+            )
+        except subprocess.TimeoutExpired:
+            return {"status": "error", "stage": "timeout",
+                    "message": (f"Code exceeded {timeout}s and was stopped. "
+                                "Use cheaper computations or raise timeout_sec "
+                                f"(max {_CODE_TIMEOUT_CAP}).")}
+
+        result: dict = {
+            "status": "ok" if proc.returncode == 0 else "error",
+            "stdout": proc.stdout[:_CODE_STDOUT_CAP],
+        }
+        if len(proc.stdout) > _CODE_STDOUT_CAP:
+            result["note"] = (f"stdout truncated to {_CODE_STDOUT_CAP} of "
+                              f"{len(proc.stdout)} chars — print less.")
+        if proc.returncode != 0:
+            result["stage"] = "execution"
+            result["stderr"] = proc.stderr[-_CODE_STDERR_CAP:]
+
+        pngs = sorted(tmpdir.glob("*.png"))
+        if len(pngs) > _CODE_MAX_FIGURES:
+            result["figures_note"] = (f"{len(pngs)} figures produced; returning "
+                                      f"the first {_CODE_MAX_FIGURES}.")
+            pngs = pngs[:_CODE_MAX_FIGURES]
+        from fastmcp.utilities.types import Image  # noqa: PLC0415
+        images = [Image(data=p.read_bytes(), format="png") for p in pngs]
+        if images:
+            result["figures"] = [p.name for p in pngs]
+        return [result, *images]
+
+
 # ── Entry point ────────────────────────────────────────────────────────────────
 
 def main() -> None:
@@ -1344,6 +1497,17 @@ def main() -> None:
             "exclude it. See TOOL_POLICY.md."
         ),
     )
+    parser.add_argument(
+        "--enable-code-tool",
+        action="store_true",
+        help=(
+            "Expose the run_python_code tool (default: OFF). It executes "
+            "agent-written Python on the SERVER HOST — contained for honest "
+            "agents (isolated subprocess, only the requested files), but not "
+            "an OS-level sandbox, so it must never be offered to benchmark "
+            "agents. Intended for assistant use. See TOOL_POLICY.md."
+        ),
+    )
     args = parser.parse_args()
 
     global _DATASETS_DIR, _RESULTS_DIR, _UPLOAD_PORT, _UPLOAD_HOST, _BEARER_TOKEN
@@ -1352,6 +1516,22 @@ def main() -> None:
     _UPLOAD_PORT   = args.upload_port
     _UPLOAD_HOST   = args.host
     _BEARER_TOKEN  = args.token or os.environ.get("STAN_MCP_TOKEN")
+
+    # ── Tool-surface gating — BEFORE any transport starts serving.  Excluding
+    # a tool client-side is not enough: any other client connecting here would
+    # still see it.  Unregister so no client can call it.  (This block used to
+    # sit after the stdio early-return, so stdio servers exposed
+    # get_run_history unconditionally.)
+    withheld: list[str] = []
+    if not args.include_run_history:
+        withheld.append("get_run_history")
+    if not args.enable_code_tool:
+        withheld.append("run_python_code")
+    for tool_name in withheld:
+        try:
+            mcp.remove_tool(tool_name)
+        except Exception as exc:          # noqa: BLE001 - never fail startup
+            print(f"  WARNING: could not withhold {tool_name}: {exc}")
 
     if args.transport == "stdio":
         import sys
@@ -1391,14 +1571,13 @@ def main() -> None:
               "returns results across all runs on a dataset; not suitable for "
               "benchmark agents, see TOOL_POLICY.md")
     else:
-        # Excluding it client-side is not enough: any other client connecting
-        # here (Claude Desktop, a re-implemented loop) would still see the
-        # tool. Unregister it so no client can call it.
-        try:
-            mcp.remove_tool("get_run_history")
-            print("  history  : get_run_history withheld (default)")
-        except Exception as exc:          # noqa: BLE001 - never fail startup
-            print(f"  WARNING: could not withhold get_run_history: {exc}")
+        print("  history  : get_run_history withheld (default)")
+    if args.enable_code_tool:
+        print("  code     : run_python_code EXPOSED (--enable-code-tool) — "
+              "executes agent code on this host; assistant use only, "
+              "never for benchmark agents, see TOOL_POLICY.md")
+    else:
+        print("  code     : run_python_code withheld (default)")
 
     mcp.run(transport="streamable-http", host=args.host, port=args.port,
             middleware=token_middleware)
