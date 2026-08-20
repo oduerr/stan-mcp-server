@@ -259,3 +259,43 @@ def test_train_url_advertised(tmp_path, monkeypatch):
     monkeypatch.setattr(srv, "_UPLOAD_PORT", 0)
     assert srv.get_capabilities()["train_download_url"] == "disabled"
     assert "train_url" not in srv.get_data_summary("benchmarks/reg1")
+
+
+# ── _load_dataset without a test set (G1: sample by dataset name) ──────────────
+
+def test_load_dataset_train_only(tmp_path, monkeypatch):
+    ds = tmp_path / "_uploaded" / "myexp"
+    ds.mkdir(parents=True)
+    (ds / "dataset.md").write_text(
+        "## Data Interface\n\n```stan\nint<lower=0> N_train;\n"
+        "vector[N_train] x_train;\nvector[N_train] y_train;\n```\n"
+    )
+    (ds / "train.csv").write_text("x,y\n1.0,2.0\n2.0,3.0\n")
+    monkeypatch.setattr(srv, "_DATASETS_DIR", tmp_path)
+
+    # Default (require_test=True) still refuses train-only datasets.
+    with pytest.raises(ValueError, match="Test file not found"):
+        srv._load_dataset("_uploaded/myexp")
+
+    data, y_test = srv._load_dataset("_uploaded/myexp", require_test=False)
+    assert data["N_train"] == 2 and data["N_test"] == 0
+    assert data["x_train"] == [1.0, 2.0] and data["x_test"] == []
+    assert data["y_test"] == [] and y_test == []
+
+
+def test_load_dataset_require_test_false_still_loads_staged(tmp_path, monkeypatch):
+    _write_grouped_dataset(tmp_path)
+    monkeypatch.setattr(srv, "_DATASETS_DIR", tmp_path)
+    data, y_test = srv._load_dataset("grouped", require_test=False)
+    assert data["N_test"] == 1 and y_test == [1.3]
+    assert data["J"] == 9   # test-set ids still counted when the file exists
+
+
+def test_sample_input_stage_errors(tmp_path, monkeypatch):
+    monkeypatch.setattr(srv, "_DATASETS_DIR", tmp_path)
+    r = srv.sample(stan_code="model {}")
+    assert r["status"] == "error" and r["stage"] == "input"
+    r = srv.sample(stan_code="model {}", dataset="../evil")
+    assert r["status"] == "error" and r["stage"] == "data_loading"
+    r = srv.sample(stan_code="model {}", dataset="nope")
+    assert r["status"] == "error" and "not found" in r["message"]

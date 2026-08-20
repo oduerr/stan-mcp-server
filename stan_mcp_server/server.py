@@ -167,8 +167,10 @@ def _save_dataset(
         "train_columns": list(train_cols.keys()),
         "note": (
             "Uploaded datasets have no held-out test set. "
-            "Use the 'sample' tool and compute PSIS-LOO on the training log_lik yourself. "
-            "fit_and_evaluate requires a pre-staged dataset with protected/test.csv."
+            f"Use sample(dataset='{_UPLOAD_DIR}/{name}') — the server loads the "
+            "train data by name — and compute PSIS-LOO on the training log_lik "
+            "yourself. fit_and_evaluate requires a pre-staged dataset with "
+            "protected/test.csv."
         ),
     }
     if interface_warnings:
@@ -471,13 +473,22 @@ def _parse_data_interface(dataset_md: str) -> dict:
     return {"train_vars": train_vars, "has_J": has_J, "j_var_bases": j_var_bases}
 
 
-def _load_dataset(dataset: str, test_file: str = "test.csv") -> tuple[dict, list]:
-    """Load train + test CSVs for a named dataset into a Stan data dict.
+def _load_dataset(
+    dataset: str,
+    test_file: str = "test.csv",
+    require_test: bool = True,
+) -> tuple[dict, list]:
+    """Load train (+ test) CSVs for a named dataset into a Stan data dict.
 
     Reads <datasets_dir>/<dataset>/train.csv and
           <datasets_dir>/<dataset>/protected/<test_file>.
     Variable names are derived from the ## Data Interface block in dataset.md;
     Stan base names must match the CSV column names exactly.
+
+    ``require_test=False`` supports train-only (uploaded) datasets for the
+    `sample` tool: when the test file is absent, N_test is 0 and every
+    ``*_test`` variable is an empty list — valid Stan data for models that
+    declare the test variables, ignored by models that do not.
 
     ``test_file`` exists so the same loader can build the SHADOW evaluation
     data (protected/shadow.csv) — see the shadow block in fit_and_evaluate.
@@ -494,11 +505,12 @@ def _load_dataset(dataset: str, test_file: str = "test.csv") -> tuple[dict, list
             if _UPLOAD_DIR not in p.parts
         ]
         raise ValueError(f"Dataset '{dataset}' not found. Available: {candidates}")
-    if not test_path.exists():
+    has_test = test_path.exists()
+    if require_test and not has_test:
         raise ValueError(f"Test file not found at {test_path}")
 
     train_cols   = _load_csv_columns(train_path)
-    test_cols    = _load_csv_columns(test_path)
+    test_cols    = _load_csv_columns(test_path) if has_test else {}
     csv_col_names = list(train_cols.keys())
 
     dataset_md   = md_path.read_text() if md_path.exists() else ""
@@ -524,10 +536,24 @@ def _load_dataset(dataset: str, test_file: str = "test.csv") -> tuple[dict, list
                 csv_to_base[csv_col] = response_candidates[0]
 
     n_train = len(next(iter(train_cols.values())))
-    n_test  = len(next(iter(test_cols.values())))
+    n_test  = len(next(iter(test_cols.values()))) if test_cols else 0
     data: dict = {"N_train": n_train, "N_test": n_test}
 
+    test_csv_cols: dict[str, str] = {}   # train CSV column -> test CSV column
     for csv_col, stan_base in csv_to_base.items():
+        if train_cols[csv_col].dtype == object:
+            raise ValueError(
+                f"Column '{csv_col}' contains non-numeric values and cannot be "
+                "passed to Stan. Encode it as integers (e.g. 1-based group ids) "
+                "in the CSV first."
+            )
+        dtype = train_vars.get(stan_base, "float")
+        conv = int if dtype == "int" else float
+        data[f"{stan_base}_train"] = [conv(v) for v in train_cols[csv_col]]
+
+        if not has_test:
+            data[f"{stan_base}_test"] = []
+            continue
         # Resolve test column: standard convention uses same name as train CSV;
         # intuitive convention uses {base}_test in test.csv.
         if csv_col in test_cols:
@@ -541,26 +567,22 @@ def _load_dataset(dataset: str, test_file: str = "test.csv") -> tuple[dict, list
                 f"Column '{csv_col}' (or '{stan_base}_test') missing from test.csv. "
                 f"test.csv columns: {list(test_cols.keys())}"
             )
-        if train_cols[csv_col].dtype == object or test_cols[test_csv_col].dtype == object:
+        if test_cols[test_csv_col].dtype == object:
             raise ValueError(
-                f"Column '{csv_col}' contains non-numeric values and cannot be "
-                "passed to Stan. Encode it as integers (e.g. 1-based group ids) "
-                "in the CSV first."
+                f"Column '{test_csv_col}' contains non-numeric values and cannot "
+                "be passed to Stan. Encode it as integers (e.g. 1-based group "
+                "ids) in the CSV first."
             )
-        dtype = train_vars.get(stan_base, "float")
-        if dtype == "int":
-            data[f"{stan_base}_train"] = [int(v) for v in train_cols[csv_col]]
-            data[f"{stan_base}_test"]  = [int(v) for v in test_cols[test_csv_col]]
-        else:
-            data[f"{stan_base}_train"] = train_cols[csv_col].tolist()
-            data[f"{stan_base}_test"]  = test_cols[test_csv_col].tolist()
+        test_csv_cols[csv_col] = test_csv_col
+        data[f"{stan_base}_test"] = [conv(v) for v in test_cols[test_csv_col]]
 
     if has_J and j_var_bases:
         j_csv_cols = [c for c, b in csv_to_base.items() if b in j_var_bases]
         all_ids: set[int] = set()
         for c in j_csv_cols:
             all_ids.update(int(v) for v in train_cols[c])
-            all_ids.update(int(v) for v in test_cols[c])
+            if has_test:
+                all_ids.update(int(v) for v in test_cols[test_csv_cols[c]])
         if all_ids and min(all_ids) < 1:
             raise ValueError(
                 f"Group id columns {j_csv_cols} must be 1-based for Stan "
@@ -806,9 +828,7 @@ def fit_and_evaluate(
         except ValueError as exc:
             return {"status": "error", "stage": "input", "message": str(exc)}
 
-    if data is None:
-        if dataset is None:
-            return {"status": "error", "stage": "input", "message": "Either 'data' (with 'y_test') or 'dataset' must be provided."}
+    if dataset is not None:
         # Reject train-only (uploaded) datasets — no held-out test set exists.
         test_path = ds_dir / "protected" / "test.csv"
         if not test_path.exists():
@@ -822,9 +842,19 @@ def fit_and_evaluate(
                 ),
             }
         try:
-            data, y_test = _load_dataset(dataset)
+            loaded, loaded_y_test = _load_dataset(dataset)
         except ValueError as exc:
             return {"status": "error", "stage": "data_loading", "message": str(exc)}
+        # `data` entries override / extend the loaded dict — the documented
+        # contract ("only pass data for extra scalars"); previously passing
+        # data made the loader silently skip the dataset entirely.
+        if data:
+            loaded.update(data)
+        data = loaded
+        if y_test is None:
+            y_test = loaded_y_test
+    elif data is None:
+        return {"status": "error", "stage": "input", "message": "Either 'data' (with 'y_test') or 'dataset' must be provided."}
 
     # y_test is optional in explicit-data mode: it is only used for the
     # log_lik shape check. NLPD is computed from log_lik alone. When omitted,
@@ -979,10 +1009,21 @@ def fit_and_evaluate(
 @mcp.tool()
 def sample(
     stan_code: str,
-    data: dict,
+    data: Optional[dict] = None,
     config: Optional[dict] = None,
+    dataset: Optional[str] = None,
 ) -> dict:
     """Sample from a Stan model and persist posterior draws to disk.
+
+    Provide `dataset` (preferred) and/or `data`:
+
+    - `dataset` loads the data by name from the server — this works for
+      train-only (uploaded) datasets too: N_train and the `*_train` variables
+      come from train.csv; when no test set exists, N_test is 0 and the
+      `*_test` variables are empty.  Never paste CSV contents into `data` —
+      use the upload endpoint and pass the dataset name instead.
+    - `data` entries override / extend the loaded dict (extra scalars the CSV
+      does not provide).  Passing `data` alone (no `dataset`) uses it as-is.
 
     Returns scalar diagnostics and a `run_id` only — raw draws are never
     returned inline.  Retrieve them via `samples_path` (directory of per-chain
@@ -990,6 +1031,20 @@ def sample(
     under --results-dir and are directly accessible when that directory is
     mounted via SSHFS on the client.
     """
+    if not data:
+        data = None
+    if dataset is not None:
+        try:
+            loaded, _ = _load_dataset(dataset, require_test=False)
+        except ValueError as exc:
+            return {"status": "error", "stage": "data_loading", "message": str(exc)}
+        if data:
+            loaded.update(data)
+        data = loaded
+    if data is None:
+        return {"status": "error", "stage": "input",
+                "message": "Either 'dataset' or 'data' must be provided."}
+
     run = _compile_and_sample(stan_code, data, config)
     if "error" in run:
         return run["error"]

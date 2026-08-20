@@ -25,9 +25,10 @@ Agent: writes a `dataset.md` with a Data Interface block → uploads both via
 `POST /dataset/sales` (shell, never through context) → `get_data_summary`
 → proposes a model → `check_model` → `sample` → explains the result.
 
-**Verdict: ⚠️** — the flow exists, but `sample` takes no `dataset=`
-parameter, so the agent must pass the data dict *inline through context*,
-which the whole design forbids. **Gap G1.**
+**Verdict: ✅** — `sample(dataset="_uploaded/…")` loads the data by name
+(train-only datasets get `N_test=0` and empty `*_test` variables); `data`
+entries extend/override for extra scalars. Enforced by
+`tests/use_cases/test_uc01_first_model.py`.
 
 ## UC-2 · Prior predictive check
 
@@ -38,9 +39,9 @@ Agent: writes the model with priors only (no likelihood statement), `sample`
 shows the figure.
 
 **Verdict: ⚠️** — the simulation is a pure convention (documented in
-[AGENTS.md](../AGENTS.md) once G1 lands); the *showing* works only in clients
+[AGENTS.md](../AGENTS.md)); the *showing* works only in clients
 that can execute local plotting code (Claude Code). In Claude Desktop there
-is no image. **Gaps G1, G2.**
+is no image. **Gap G2.**
 
 ## UC-3 · Prior choice iteration
 
@@ -51,7 +52,7 @@ Agent: adjusts priors → repeats UC-2 → shows before/after side by side and
 explains the reasoning.
 
 **Verdict: ⚠️** — same dependencies as UC-2. The iteration itself is cheap
-(compile cache makes refits fast). **Gaps G1, G2.**
+(compile cache makes refits fast). **Gap G2.**
 
 ## UC-4 · Fit and "did all go well?"
 
@@ -98,7 +99,7 @@ diagnostics demand (UC-4) → compares against complete pooling (UC-6).
 
 **Verdict: ⚠️** — everything composes from UC-1/4/6; inherits their gaps.
 The `J` handling (max id, 1-based validation) is already server-side.
-**Gaps G1, G2, G3.**
+**Gaps G2, G3.**
 
 ## UC-8 · Predict for new inputs
 
@@ -132,7 +133,7 @@ flip and a test under `tests/use_cases/` enforces them.
 
 | Gap | What | Unblocks | Status |
 |---|---|---|---|
-| **G1** | `sample(dataset=…)` — load uploaded/staged data by name instead of inline through context | UC-1, 2, 3, 7 | open |
+| **G1** | `sample(dataset=…)` — load uploaded/staged data by name instead of inline through context | UC-1, 2, 3, 7 | **closed** (2026-08-20) — incl. merge contract for `data` in both fit tools |
 | **G2** | `run_python_code(code, dataset=…, run_id=…)` — contained server-side execution with train columns and/or the run's draws preloaded, figures returned as MCP **image content** (works in every client, incl. Claude Desktop) | UC-2, 3, 5, 6, 7 | open — design discussed; must be flag-gated, TOOL_POLICY row, leak-probe test |
 | **G3** | Consultation-grade diagnostics: E-BFMI, treedepth saturation, per-parameter worst R-hat/ESS, divergences per chain | UC-4, 7 | open |
 | **G4** | Standalone generated-quantities pass over an existing fit (reuse the shadow-pass machinery) | UC-8 | open — low priority |
