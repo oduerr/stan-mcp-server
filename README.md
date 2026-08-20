@@ -44,10 +44,10 @@ server: {"nlpd": 1.17, …}          ← oracle for this dataset: 0.94
 > `benchmarks/regression_1d` dataset, improve it once, and explain the result
 > to me in plain language.
 
-Your agent will install everything (Python environment, CmdStan — the one
-slow step, ~15 minutes of C++ compilation, once per machine), start the
-server, and walk you through a model-improvement loop like the transcript
-above.
+Your agent will install everything (Python environment, plus a one-time
+CmdStan build — under a minute on a modern laptop with a parallel build,
+longer on older hardware), start the server, and walk you through a
+model-improvement loop like the transcript above.
 
 **Then bring your own data.** Once the server is installed, this works too:
 
@@ -61,7 +61,7 @@ above.
 ```bash
 git clone https://github.com/oduerr/stan-mcp-server.git && cd stan-mcp-server
 uv venv && uv pip install -e .
-.venv/bin/python -c "import cmdstanpy; cmdstanpy.install_cmdstan()"   # once
+.venv/bin/python -c "import cmdstanpy, os; cmdstanpy.install_cmdstan(cores=os.cpu_count())"  # once
 .venv/bin/stan-mcp-server --datasets-dir datasets --results-dir results
 ```
 

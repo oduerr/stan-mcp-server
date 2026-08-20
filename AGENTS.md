@@ -58,10 +58,12 @@ Without `uv`: `python3 -m venv .venv && .venv/bin/pip install -e .`
 ```
 
 - If this prints a path: CmdStan is already installed — continue.
-- If it raises an error: install it (10–20 minutes, compiles C++):
+- If it raises an error: install it. Pass `cores` — the default builds
+  single-threaded. Measured: ~45 s on a 10-core laptop with all cores; expect
+  a few minutes on older hardware.
 
 ```bash
-.venv/bin/python -c "import cmdstanpy; cmdstanpy.install_cmdstan()"
+.venv/bin/python -c "import cmdstanpy, os; cmdstanpy.install_cmdstan(cores=os.cpu_count())"
 ```
 
 **Verify:** the `cmdstan_path()` check now prints a path.
