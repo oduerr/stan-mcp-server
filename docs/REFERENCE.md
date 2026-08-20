@@ -155,6 +155,32 @@ The wall-clock ceiling exists because a pathological posterior samples
 forever; a timeout is returned to the agent as a normal error
 (`stage: sampling_timeout`) with a hint to simplify the model.
 
+## Sampler diagnostics
+
+Every fit returns two layers. The **core scalars** (`n_divergences`,
+`r_hat_max`, `ess_bulk_min`) answer "is this run valid" and feed the
+benchmark validity gate. The **`sampler_diagnostics` block** answers "what
+went wrong where":
+
+```json
+{
+  "divergences_per_chain": [1, 3],
+  "n_max_treedepth": 0, "max_treedepth_frac": 0.0, "max_treedepth_limit": 10,
+  "e_bfmi_per_chain": [0.157, 0.097],
+  "stepsize_per_chain": [0.42, 0.39],
+  "worst_r_hat":    [{"param": "y", "r_hat": 1.886}, ...],
+  "lowest_ess_bulk": [{"param": "lp__", "ess_bulk": 2}, ...],
+  "flags": [
+    "4 divergent transition(s) (per chain: [1, 3]) — biased exploration; ...",
+    "low E-BFMI in chain 1 (0.157), chain 2 (0.097) — often a funnel; reparameterise"
+  ]
+}
+```
+
+Thresholds behind `flags`: any divergence; >1 % of draws at max treedepth;
+E-BFMI < 0.2; R-hat > 1.01; bulk ESS < 100 per chain. A healthy run has
+`flags: []`.
+
 ## Run assets — logs and posterior draws
 
 Every `sample` and `fit_and_evaluate` call persists results under a short

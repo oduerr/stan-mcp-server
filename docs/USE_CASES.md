@@ -61,11 +61,12 @@ explains the reasoning.
 Agent: `sample` → reads `n_divergences`, `r_hat_max`, `ess_bulk_min` →
 reads `logs_path` if something is off → answers in plain language.
 
-**Verdict: ⚠️** — works, but the diagnostics are benchmark-grade ("is this
-run valid"), not consultation-grade ("*what* went wrong *where*"). Missing:
-E-BFMI, treedepth saturation, per-parameter worst offenders, divergences per
-chain — the numbers behind advice like "the funnel is in `tau`, go
-non-centred". **Gap G3.**
+**Verdict: ✅** — every fit returns a `sampler_diagnostics` block:
+divergences and E-BFMI per chain, treedepth saturation, step sizes, the worst
+parameters by R-hat / bulk ESS, and terse `flags` ("low E-BFMI in chain 2
+(0.097) — often a funnel; reparameterise"). Enforced by
+`tests/use_cases/test_uc04_diagnostics.py` (a funnel must light up, a healthy
+model must stay quiet).
 
 ## UC-5 · Posterior predictive check
 
@@ -97,9 +98,8 @@ Agent: declares a group column via the Data Interface (`J`, 1-based ids) →
 per-group summaries to justify pooling → centred vs non-centred as
 diagnostics demand (UC-4) → compares against complete pooling (UC-6).
 
-**Verdict: ⚠️** — composes from UC-1/4/6; what remains missing is the
-consultation-grade diagnostics for the centred/non-centred decision.
-**Gap G3.**
+**Verdict: ✅** — composes from UC-1/4/6, all closed: the
+centred/non-centred decision is exactly what UC-4's flags inform.
 
 ## UC-8 · Predict for new inputs
 
@@ -135,5 +135,5 @@ flip and a test under `tests/use_cases/` enforces them.
 |---|---|---|---|
 | **G1** | `sample(dataset=…)` — load uploaded/staged data by name instead of inline through context | UC-1, 2, 3, 7 | **closed** (2026-08-20) — incl. merge contract for `data` in both fit tools |
 | **G2** | `run_python_code(code, dataset=…, run_id=…)` — contained server-side execution with train columns and/or the run's draws preloaded, figures returned as MCP **image content** (works in every client, incl. Claude Desktop) | UC-2, 3, 5, 6, 7 | **closed** (2026-08-20) — flag-gated (`--enable-code-tool`), TOOL_POLICY row, containment test |
-| **G3** | Consultation-grade diagnostics: E-BFMI, treedepth saturation, per-parameter worst R-hat/ESS, divergences per chain | UC-4, 7 | open |
+| **G3** | Consultation-grade diagnostics: E-BFMI, treedepth saturation, per-parameter worst R-hat/ESS, divergences per chain | UC-4, 7 | **closed** (2026-08-20) — `sampler_diagnostics` block on every fit |
 | **G4** | Standalone generated-quantities pass over an existing fit (reuse the shadow-pass machinery) | UC-8 | open — low priority |
