@@ -2,14 +2,21 @@
 
 Give an LLM agent safe hands for Bayesian modelling. The agent writes
 [Stan](https://mc-stan.org) code; this server compiles it, runs MCMC
-(CmdStan), and answers with one honest number — the negative log predictive
-density (NLPD) on **held-out data the agent can never see** — plus
-convergence diagnostics. Raw data and posterior draws stay on disk and never
-enter the model's context.
+(CmdStan), and answers with compact JSON — scores and convergence
+diagnostics, never raw sampler output. Data and posterior draws stay on disk
+and never enter the model's context.
 
-This is the evaluation server behind the
-[AutoStan](https://github.com/tidit-ch/autostan) loop: propose a model → fit →
-read the score → reason → propose a better one.
+**Two ways to use it:**
+
+- **As a Stan assistant for your own work.** Upload your CSV, then let the
+  agent do what it is good at: write the first model, fix the compile errors,
+  explain the divergences, compare models with PSIS-LOO, tighten the priors —
+  while the server does the fitting and keeps bulk data out of the
+  conversation.
+- **As the evaluation server of the
+  [AutoStan](https://github.com/tidit-ch/autostan) loop**, where an agent
+  iterates against the NLPD on **held-out data it can never see**: propose a
+  model → fit → read the score → reason → propose a better one.
 
 ```
 agent:  fit_and_evaluate(stan_code="…linear model…", dataset="benchmarks/regression_1d")
@@ -42,6 +49,13 @@ slow step, ~15 minutes of C++ compilation, once per machine), start the
 server, and walk you through a model-improvement loop like the transcript
 above.
 
+**Then bring your own data.** Once the server is installed, this works too:
+
+> I have my data in `sales.csv` and want a Bayesian model for it. Upload it
+> to the Stan MCP server, look at the data summary, propose a model, fit it,
+> and compare a couple of variants with PSIS-LOO. Explain your choices as
+> you go.
+
 ## Quick start (technical humans)
 
 ```bash
@@ -69,9 +83,10 @@ tools, dataset conventions, uploads, remote deployment, auth — is in
 
 ## The safety model, in three sentences
 
-Held-out test labels live in `protected/` directories that no tool and no
-endpoint will serve — the agent optimises against a score it cannot fit
-directly. Bulk data moves over a separate HTTP channel, so nothing large ever
-enters LLM context. What each tool may leak, and which tools a benchmark
-agent may be offered, is specified in [TOOL_POLICY.md](TOOL_POLICY.md) — the
-single authoritative document.
+Bulk data moves over a separate HTTP channel, so nothing large ever enters
+LLM context — that holds for your own uploads as much as for benchmarks.
+Held-out test labels (when a dataset has them) live in `protected/`
+directories that no tool and no endpoint will serve, so an agent optimises
+against a score it cannot fit directly. What each tool may leak, and which
+tools a benchmark agent may be offered, is specified in
+[TOOL_POLICY.md](TOOL_POLICY.md) — the single authoritative document.

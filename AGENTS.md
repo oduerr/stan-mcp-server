@@ -7,8 +7,10 @@ human in plain language.
 
 **What this server is:** it gives you structured Bayesian modelling tools
 over MCP. You write Stan code; the server compiles it, runs MCMC, and returns
-compact JSON (NLPD on held-out data, convergence diagnostics). Raw data and
-posterior draws stay on disk — never request them into your context.
+compact JSON (scores and convergence diagnostics). Raw data and posterior
+draws stay on disk — never request them into your context. It serves two
+jobs: helping your human model **their own data** (step 7), and benchmark
+loops where a model is scored on held-out data (`fit_and_evaluate`).
 
 **Rules while working with this repository:**
 
@@ -137,6 +139,35 @@ Using the MCP tools (not shell), on the bundled dataset:
    show that the NLPD drops (linear Gaussian ≈ 2.2; Student-t lands near 1.6).
 4. Explain to your human: **lower NLPD = better predictions of unseen data**,
    and the test labels never entered your context.
+
+## 7. Working with your human's own data
+
+The server is not only for benchmarks — it is a general Stan back end. When
+your human brings a CSV:
+
+1. Call `get_upload_instructions` for the upload URL, then upload **from the
+   shell**, never by pasting the CSV into a tool argument:
+   ```bash
+   curl -X POST http://127.0.0.1:8766/dataset/<name> -F train=@their_data.csv
+   ```
+   Write a small `dataset.md` with a `## Data Interface` block first and pass
+   it as `-F dataset_md=@dataset.md` — without it no CSV columns are loaded
+   (see [docs/REFERENCE.md](docs/REFERENCE.md), *dataset.md convention*).
+2. `get_data_summary(dataset="_uploaded/<name>")` to inspect the data.
+3. Uploaded datasets are **train-only**: use `sample` (not `fit_and_evaluate`)
+   and compare models with PSIS-LOO on the training `log_lik`. The draws are
+   on disk at `samples_path` — compute the comparison with a script:
+   ```python
+   import glob, arviz as az
+   idata = az.from_cmdstan(sorted(glob.glob("<samples_path>/samples/*.csv")))
+   print(az.loo(idata))
+   ```
+4. Beyond scores, do what a good statistician does: read `logs_path` when a
+   fit misbehaves, explain divergences and R-hat in plain language, propose
+   prior and likelihood changes one at a time, and say *why*.
+5. If your human wants honest held-out evaluation, tell them to place a test
+   split at `<datasets-dir>/_uploaded/<name>/protected/test.csv` themselves —
+   then `fit_and_evaluate` works and you must not look at that file.
 
 ## Troubleshooting
 
