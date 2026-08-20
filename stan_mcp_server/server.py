@@ -15,9 +15,10 @@ Serves tools over HTTP (streamable-http transport):
 Run assets (logs, posterior draws) are stored server-side under
 <results-dir>/_runs/<run_id>/; tools return their filesystem paths
 (`logs_path` / `samples_path`), directly accessible when --results-dir
-is mounted via SSHFS on the client.  The HTTP sidecar serves a single
-endpoint:
+is mounted via SSHFS on the client.  The HTTP sidecar serves:
     POST /dataset/{name}   — upload train CSV + optional dataset.md (multipart)
+    GET  /train/{dataset}  — download train.csv (?file=dataset.md for the md);
+                             never serves anything under protected/
 
 Usage
 -----
@@ -175,9 +176,48 @@ def _save_dataset(
     return result
 
 
-# ── HTTP upload app (runs on --upload-port in a daemon thread) ─────────────────
+# ── HTTP sidecar app (runs on --upload-port in a daemon thread) ────────────────
 
-_upload_app = FastAPI(title="Stan dataset upload", docs_url=None, redoc_url=None)
+_upload_app = FastAPI(title="Stan dataset sidecar", docs_url=None, redoc_url=None)
+
+
+# Bulk data bypasses LLM context in BOTH directions: uploads come in via
+# POST /dataset, and train data goes out via this endpoint.  Clients (a coding
+# agent's curl, or the benchmark loop at run start) download train.csv to disk;
+# only aggregates of it ever enter the model's context.
+_SERVABLE_FILES = ("train.csv", "dataset.md")
+
+
+@_upload_app.get("/train/{dataset:path}")
+async def _http_get_train(dataset: str, file: str = "train.csv"):
+    """Serve a dataset's train.csv or dataset.md — never anything else.
+
+    This is deliberately NOT a generic file server: the filename is chosen
+    from a two-entry whitelist, the dataset name is traversal-checked, and
+    a final guard refuses any path that contains 'protected'.  Held-out
+    labels (protected/test.csv, protected/shadow.csv) must stay unreachable
+    over HTTP — see TOOL_POLICY.md, leak class L1.
+    """
+    from fastapi.responses import FileResponse  # noqa: PLC0415
+
+    if file not in _SERVABLE_FILES:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Only {list(_SERVABLE_FILES)} are served by this endpoint.",
+        )
+    try:
+        ds_dir = _resolve_under(_DATASETS_DIR, dataset)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    path = ds_dir / file
+    if "protected" in path.parts:  # belt and braces — see docstring
+        raise HTTPException(status_code=403, detail="protected/ is never served.")
+    if not path.is_file():
+        raise HTTPException(
+            status_code=404, detail=f"{file} not found for dataset '{dataset}'."
+        )
+    media_type = "text/csv" if file.endswith(".csv") else "text/markdown"
+    return FileResponse(path, media_type=media_type, filename=file)
 
 
 @_upload_app.post("/dataset/{name}")
@@ -1018,7 +1058,7 @@ def get_data_summary(dataset: str) -> dict:
         test_cols = _load_csv_columns(test_path)
         n_test = len(next(iter(test_cols.values())))
 
-    return {
+    result = {
         "dataset": dataset,
         "tier": tier,
         "has_test": has_test,
@@ -1027,6 +1067,13 @@ def get_data_summary(dataset: str) -> dict:
         "columns": {col: _col_stats(arr) for col, arr in train_cols.items()},
         "dataset_md": dataset_md,
     }
+    # Direct download URL for the train CSV (never test/shadow data).  Meant
+    # for clients that run code locally: fetch to disk, compute aggregates
+    # there, and keep raw rows out of LLM context.
+    base_url = _run_base_url()
+    if base_url:
+        result["train_url"] = f"{base_url}/train/{dataset}"
+    return result
 
 
 # ── Tool: get_upload_instructions ─────────────────────────────────────────────
@@ -1171,6 +1218,7 @@ def get_capabilities() -> dict:
     """
     base_url = _run_base_url()
     upload_url = f"{base_url}/dataset/{{name}}" if base_url else "disabled"
+    train_url  = f"{base_url}/train/{{dataset}}" if base_url else "disabled"
     return {
         "server": "stan-mcp-server",
         "version": _VERSION,
@@ -1189,6 +1237,10 @@ def get_capabilities() -> dict:
         "results_dir": str(_RESULTS_DIR),
         "model_cache_dir": str(_MODEL_CACHE),
         "http_upload_url": upload_url,
+        # Bulk train-data download — clients fetch this to DISK, never into
+        # LLM context.  Serves only train.csv and dataset.md; protected/ is
+        # unreachable by construction (whitelist + traversal check).
+        "train_download_url": train_url,
     }
 
 

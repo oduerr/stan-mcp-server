@@ -45,6 +45,34 @@ the ones that actually bit us.**
 | `get_upload_instructions` | HTTP upload URL and fields | none | ✅ yes |
 | `get_run_history` | **every logged iteration for the dataset, across all sessions and agents** — NLPDs, notes, rationales | **L2** | ❌ **no — must never be offered** |
 
+## HTTP sidecar endpoints
+
+The sidecar (`--upload-port`) is part of the surface too — bulk data moves
+through it in both directions, deliberately outside LLM context.
+
+| Endpoint | Direction | Carries | Leak risk |
+|---|---|---|---|
+| `POST /dataset/{name}` | in | train CSV + dataset.md (uploads) | none — test data is never accepted; the operator places it manually |
+| `GET /train/{dataset}` | out | `train.csv` or `dataset.md` **only** | none — train data is the agent's input by definition; the filename is whitelisted, dataset names are traversal-checked, and any path containing `protected/` is refused |
+
+`GET /train` exists so clients can run EDA code **locally** on the raw train
+set: the loop (or a coding agent) downloads the CSV to disk, computes
+aggregates there, and only the aggregates enter context.  This moves the L1
+boundary from "sandbox around agent code" to "the server refuses to serve
+`protected/`" — much easier to guarantee and to test.
+
+**Caveat — same-machine runs.** The guarantee above holds only when the
+machine executing agent-written EDA code has no filesystem access to
+`datasets/*/protected/`.  If the loop runs on the server host, local code can
+read the protected files directly off disk, bypassing HTTP entirely.  Either
+run code-enabled loops on a different machine, or deny the loop's user read
+permission on `protected/` (`chmod 700`, owned by the server user).
+
+**Comparability.** Runs where the agent had raw-train EDA (via this endpoint
+or any code-execution tool) measure a different task than summary-stats-only
+runs.  The loop must record the capability in its run log (`eda_code_enabled`)
+so the two populations are never pooled silently.
+
 ### Notes on the two sensitive entries
 
 **`fit_and_evaluate` returns the test NLPD, and that is intended.** The
