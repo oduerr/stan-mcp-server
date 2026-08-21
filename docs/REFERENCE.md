@@ -40,6 +40,50 @@ stan-mcp-server \
   --transport streamable-http   # or 'stdio' for Claude Desktop via SSH
 ```
 
+## How to connect
+
+Two transports (`streamable-http`, `stdio`) × two locations (the server on
+your machine or on a remote one) give five practical topologies. Pick by the
+client you use and where the sampling should run.
+
+| # | Topology | Client connects by | Claude Desktop? | Sidecar: uploads + `GET /train` | Auth | Recommended for |
+|---|---|---|---|---|---|---|
+| 1 | **Local HTTP** (default) | `http://127.0.0.1:8765/mcp` | ❌ | ✅ | none needed | **Claude Code / opencode on your own machine — start here** |
+| 2 | **Remote HTTP, direct** | `http://host:8765/mcp` | ❌ | ✅ (remote port) | `--token` **required** | only inside a trusted network (VPN/Tailscale) — see the TLS caveat |
+| 3 | **Remote HTTP via SSH tunnel** | `http://127.0.0.1:8765/mcp` after `ssh -L` | ❌ | ✅ through the tunnel | the tunnel | **the recommended way to use a remote sampling machine** |
+| 4 | **Local stdio** | client launches the binary | ✅ | ❌ — copy files instead | rejected by design | **Claude Desktop on your own machine** |
+| 5 | **Remote stdio over SSH** | client launches `ssh host stan-mcp-server --transport stdio …` | ✅ | ❌ — copy files on the remote box | SSH | **Claude Desktop + a remote sampling machine** (the only combination that does both) |
+
+### Recommendations
+
+- **Start with #1.** One command, everything works, nothing to secure.
+- **Remote sampling: prefer #3 over #2.** The tunnel encrypts the hop, needs
+  no open port, and the client config is identical to the local one. Reach for
+  #2 only when a tunnel is impractical, and then only on a trusted network.
+- **Claude Desktop: #4 locally, #5 for a remote machine.** Desktop's
+  `claude_desktop_config.json` launches a subprocess (`command`/`args`) and has
+  no `url` field for local servers, so HTTP topologies are not available to it.
+- **Never expose #2 to the open internet.** This server speaks plain HTTP with
+  no TLS, so a bearer token travels in clear. SSH (#3/#5) or a VPN is the
+  encryption layer.
+- **Run assets on remote setups**: `logs_path` / `samples_path` refer to the
+  *server's* filesystem. Either mount `--results-dir` with SSHFS, or — usually
+  simpler — call `run_python_code(run_id=…)` and let the server analyse the
+  draws where they already are.
+
+### What stdio changes
+
+| | `streamable-http` (default) | `stdio` |
+|---|---|---|
+| HTTP sidecar (8766) | runs: uploads + `GET /train` | **not started** |
+| Dataset upload | `POST /dataset/{name}` | copy files into `<datasets-dir>/_uploaded/<name>/` — `get_upload_instructions` returns the exact path |
+| `--token` | enforced by ASGI middleware | **rejected at startup** (middleware is HTTP-only, so accepting it would promise auth that never applies) |
+| Startup banner | stdout | stderr (stdout carries the protocol) |
+
+Under stdio no tool advertises a sidecar URL: `get_capabilities` reports
+`http_upload_url` / `train_download_url` as `disabled` and `get_data_summary`
+omits `train_url`, so the agent is never pointed at a dead port.
+
 `--include-run-history` additionally exposes the `get_run_history` tool
 (default: withheld). It returns cross-session results and must never be
 offered to benchmark agents — see [TOOL_POLICY.md](../TOOL_POLICY.md).
@@ -367,7 +411,9 @@ Because tool responses return `logs_path` / `samples_path` as absolute paths
 under `--results-dir`, and the mount makes those paths locally accessible,
 the agent can read logs and samples directly.
 
-### 4. Connect from Claude Desktop
+### 4. Connect a client
+
+For clients that take a URL (Claude Code, opencode, `.mcp.json`):
 
 ```json
 {
@@ -379,6 +425,12 @@ the agent can read logs and samples directly.
   }
 }
 ```
+
+**Claude Desktop cannot use a URL for a local server** — its config launches a
+subprocess over stdio. To reach a remote server from Desktop, have the stdio
+command do the hop, e.g. `ssh user@host /path/to/stan-mcp-server --transport
+stdio --datasets-dir … --results-dir …`, or run a local stdio↔HTTP bridge.
+See *Transports* below for what stdio changes.
 
 
 

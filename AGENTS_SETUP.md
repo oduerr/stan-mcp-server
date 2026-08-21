@@ -96,7 +96,9 @@ curl -s http://127.0.0.1:8766/train/benchmarks/regression_1d | head -2
 
 ## 5. Register the server with the MCP client
 
-Pick the client your human uses:
+Pick the client your human uses. For remote servers, or to see all five
+topologies with recommendations, read *How to connect* in
+[docs/REFERENCE.md](docs/REFERENCE.md).
 
 **Claude Code:**
 
@@ -104,8 +106,32 @@ Pick the client your human uses:
 claude mcp add --transport http stan http://127.0.0.1:8765/mcp
 ```
 
-**Claude Desktop / any client using JSON config** (`.mcp.json` or
-`claude_desktop_config.json`):
+**Claude Desktop** — its `claude_desktop_config.json` launches local servers
+as a subprocess over **stdio**; it has no `url` field for local servers, so do
+not start a separate HTTP server for it. Settings → Developer → Edit Config:
+
+```json
+{
+  "mcpServers": {
+    "stan": {
+      "command": "/absolute/path/to/stan-mcp-server/.venv/bin/stan-mcp-server",
+      "args": ["--transport", "stdio",
+               "--datasets-dir", "/absolute/path/to/datasets",
+               "--results-dir", "/absolute/path/to/results",
+               "--enable-code-tool"]
+    }
+  }
+}
+```
+
+Paths must be absolute. Restart Claude Desktop afterwards; its log is
+`~/Library/Logs/Claude/mcp-server-stan.log` (macOS), which captures this
+server's stderr banner. Under stdio there is **no HTTP sidecar**: uploads go
+by file copy (`get_upload_instructions` returns the exact directory), no
+train-download URL is advertised, and `--token` is rejected — the client owns
+the subprocess, so no network auth applies.
+
+**Other clients using a JSON config with URLs** (`.mcp.json`):
 
 ```json
 {

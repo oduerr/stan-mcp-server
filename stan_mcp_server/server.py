@@ -82,6 +82,9 @@ _UPLOAD_PORT:   int  = 8766          # 0 = disabled
 _UPLOAD_HOST:   str  = "127.0.0.1"
 _UPLOAD_DIR:    str  = "_uploaded"
 _BEARER_TOKEN:  Optional[str] = None  # set by --token; None = no auth
+# Which transport main() started.  In stdio mode the HTTP sidecar thread is
+# never started, so no tool may advertise an upload/download URL for it.
+_TRANSPORT:     str  = "streamable-http"
 
 
 class _BearerTokenMiddleware:
@@ -248,8 +251,13 @@ def _make_run_id() -> str:
 
 
 def _run_base_url() -> Optional[str]:
-    """Return the HTTP sidecar base URL, or None when the port is disabled."""
-    if not _UPLOAD_PORT:
+    """Return the HTTP sidecar base URL, or None when it is not reachable.
+
+    None in stdio mode: the client launches the server as a subprocess and no
+    sidecar thread runs, so advertising http://…:8766 would send the agent to
+    a dead port.
+    """
+    if _TRANSPORT == "stdio" or not _UPLOAD_PORT:
         return None
     host = _UPLOAD_HOST if _UPLOAD_HOST != "0.0.0.0" else "127.0.0.1"
     return f"http://{host}:{_UPLOAD_PORT}"
@@ -1264,6 +1272,39 @@ def get_upload_instructions() -> dict:
     the `data` parameter to override them or to supply additional scalars the
     CSV does not provide.
     """
+    if _TRANSPORT == "stdio":
+        # No sidecar runs under stdio — but the server is a child process of
+        # the client, i.e. on the same machine, so copying the files in is the
+        # natural equivalent and keeps CSV content out of LLM context just as
+        # the HTTP upload does.
+        target = _DATASETS_DIR / _UPLOAD_DIR / "{name}"
+        return {
+            "status": "ok",
+            "method": "file_copy",
+            "reason": (
+                "This server runs over stdio (no HTTP endpoint). Copy the files "
+                "into the datasets directory instead — never paste CSV contents "
+                "into a tool argument."
+            ),
+            "target_dir": str(target),
+            "files": {
+                "train.csv": "required — training data, including the header row",
+                "dataset.md": (
+                    "required in practice — must contain a '## Data Interface' "
+                    "Stan block declaring the _train variables, else no CSV "
+                    "columns are loaded"
+                ),
+            },
+            "example_shell": (
+                f"mkdir -p {target} && cp train.csv dataset.md {target}/"
+            ),
+            "note": (
+                "Afterwards the dataset name is '{upload}/<name>' — pass it to "
+                "get_data_summary / sample. Held-out test data must be placed by "
+                "the operator at <target_dir>/protected/test.csv to enable "
+                "fit_and_evaluate; the agent must never read that file."
+            ).replace("{upload}", _UPLOAD_DIR),
+        }
     if not _UPLOAD_PORT:
         return {
             "status": "disabled",
@@ -1644,12 +1685,24 @@ def main() -> None:
     )
     args = parser.parse_args()
 
-    global _DATASETS_DIR, _RESULTS_DIR, _UPLOAD_PORT, _UPLOAD_HOST, _BEARER_TOKEN
+    # A token is enforced by ASGI middleware, which only exists on the HTTP
+    # transports. Accepting it under stdio would promise an authentication
+    # that is never applied — fail loudly instead.
+    if args.transport == "stdio" and (args.token or os.environ.get("STAN_MCP_TOKEN")):
+        parser.error(
+            "--token (or STAN_MCP_TOKEN) cannot be used with --transport stdio: "
+            "the bearer check is HTTP middleware and would be silently ignored. "
+            "Under stdio the client launches the server as its own subprocess, "
+            "so access is already limited to that client."
+        )
+
+    global _DATASETS_DIR, _RESULTS_DIR, _UPLOAD_PORT, _UPLOAD_HOST, _BEARER_TOKEN, _TRANSPORT
     _DATASETS_DIR  = args.datasets_dir.resolve()
     _RESULTS_DIR   = args.results_dir.resolve()
     _UPLOAD_PORT   = args.upload_port
     _UPLOAD_HOST   = args.host
     _BEARER_TOKEN  = args.token or os.environ.get("STAN_MCP_TOKEN")
+    _TRANSPORT     = args.transport
 
     # ── Tool-surface gating — BEFORE any transport starts serving.  Excluding
     # a tool client-side is not enough: any other client connecting here would
@@ -1669,7 +1722,16 @@ def main() -> None:
 
     if args.transport == "stdio":
         import sys
-        print(f"Stan MCP Server (stdio) — datasets: {_DATASETS_DIR}  results: {_RESULTS_DIR}", file=sys.stderr)
+        # stderr, not stdout: stdout carries the MCP protocol here. Claude
+        # Desktop captures this into ~/Library/Logs/Claude/mcp-server-*.log.
+        print(f"Stan MCP Server {_VERSION} (stdio) — datasets: {_DATASETS_DIR}  "
+              f"results: {_RESULTS_DIR}", file=sys.stderr)
+        print(f"  tools withheld : {', '.join(withheld) if withheld else 'none'}"
+              f"  (--include-run-history / --enable-code-tool to expose)",
+              file=sys.stderr)
+        print("  http sidecar   : not started under stdio — get_upload_instructions "
+              "returns the file-copy method; no train-download URL",
+              file=sys.stderr)
         mcp.run(transport="stdio")
         return
 
