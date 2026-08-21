@@ -29,4 +29,4 @@ jobs:
       - name: Show resolved arviz
         run: python -c "import arviz; print('arviz', arviz.__version__)"
       - name: Run tests (no CmdStan)
-        run: pytest test_helpers.py test_shadow_isolation.py tests/use_cases -k "not runs_shadow" -q
+        run: pytest test_helpers.py test_shadow_isolation.py test_server_stdio.py tests/use_cases -k "not runs_shadow" -q

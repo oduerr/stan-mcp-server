@@ -40,6 +40,21 @@ stan-mcp-server \
   --transport streamable-http   # or 'stdio' for Claude Desktop via SSH
 ```
 
+## Transports
+
+| | `streamable-http` (default) | `stdio` |
+|---|---|---|
+| Client connects by | URL (`http://host:8765/mcp`) | launching the server as a subprocess |
+| Used by | Claude Code, opencode, `.mcp.json` clients | **Claude Desktop** (its config has no `url` for local servers) |
+| HTTP sidecar (8766) | runs: uploads + `GET /train` | **not started** |
+| Dataset upload | `POST /dataset/{name}` | copy files into `<datasets-dir>/_uploaded/<name>/` — `get_upload_instructions` returns the exact path |
+| `--token` | enforced by ASGI middleware | **rejected at startup** (middleware is HTTP-only, so accepting it would promise auth that never applies) |
+| Startup banner | stdout | stderr (stdout carries the protocol) |
+
+Under stdio no tool advertises a sidecar URL: `get_capabilities` reports
+`http_upload_url` / `train_download_url` as `disabled` and `get_data_summary`
+omits `train_url`, so the agent is never pointed at a dead port.
+
 `--include-run-history` additionally exposes the `get_run_history` tool
 (default: withheld). It returns cross-session results and must never be
 offered to benchmark agents — see [TOOL_POLICY.md](../TOOL_POLICY.md).
@@ -367,7 +382,9 @@ Because tool responses return `logs_path` / `samples_path` as absolute paths
 under `--results-dir`, and the mount makes those paths locally accessible,
 the agent can read logs and samples directly.
 
-### 4. Connect from Claude Desktop
+### 4. Connect a client
+
+For clients that take a URL (Claude Code, opencode, `.mcp.json`):
 
 ```json
 {
@@ -379,6 +396,12 @@ the agent can read logs and samples directly.
   }
 }
 ```
+
+**Claude Desktop cannot use a URL for a local server** — its config launches a
+subprocess over stdio. To reach a remote server from Desktop, have the stdio
+command do the hop, e.g. `ssh user@host /path/to/stan-mcp-server --transport
+stdio --datasets-dir … --results-dir …`, or run a local stdio↔HTTP bridge.
+See *Transports* below for what stdio changes.
 
 
 
