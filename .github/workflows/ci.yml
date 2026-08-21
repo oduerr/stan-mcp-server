@@ -12,12 +12,21 @@ jobs:
     # compiled CmdStan and is deselected here; run it locally with
     #   python test_shadow_isolation.py --with-fit
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # 3.11 resolves arviz 0.x, 3.12 resolves arviz 1.x (it requires
+        # >=3.12). Both must keep working: the code tool's draw loader and
+        # the documented snippets differ between the two majors.
+        python-version: ["3.11", "3.12"]
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
-          python-version: "3.11"
+          python-version: ${{ matrix.python-version }}
       - name: Install package
         run: pip install -e .[dev]
+      - name: Show resolved arviz
+        run: python -c "import arviz; print('arviz', arviz.__version__)"
       - name: Run tests (no CmdStan)
         run: pytest test_helpers.py test_shadow_isolation.py tests/use_cases -k "not runs_shadow" -q

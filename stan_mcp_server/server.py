@@ -1500,8 +1500,10 @@ def run_python_code(
     .png in the working directory (or via plt.savefig) is returned as an
     image, up to 4 per call.  Never print raw data rows.
 
-    Typical uses: EDA on the train columns, prior/posterior predictive plots
-    (az.plot_ppc), trace plots (az.plot_trace), PSIS-LOO (az.loo(idata)).
+    Typical uses: EDA on the train columns, prior/posterior predictive plots,
+    trace plots (az.plot_trace), PSIS-LOO (az.loo(idata)).  The arviz PPC API
+    differs by major version (az.plot_ppc on 0.x; az.plot_ppc_dist and friends
+    on 1.x) — check az.__version__, or plot the overlay yourself.
 
     The code runs in an isolated working directory containing only the
     requested files, with a wall-clock limit (default 60 s, max 120 s).

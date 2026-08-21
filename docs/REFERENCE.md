@@ -4,7 +4,7 @@ For a first start, read the
 
 - [README](../README.md) for installation  
 - [AGENTS_SETUP.md](../AGENTS_SETUP.md) how to install the server-
-- [TOOL_POLICY.md](../TOOL_POLICY.md) for the leakage model and the permitted agent 
+- [TOOL_POLICY.md](../TOOL_POLICY.md) for the leakage model and the permitted agent
 
 ## Architecture
 
@@ -25,8 +25,7 @@ Two channels, deliberately separate:
 | HTTP sidecar (port 8766) | bulk bytes: dataset uploads, train downloads | no — client ↔ server directly |
 
 
-Held-out data (`protected/test.csv`, `protected/shadow.csv`) is reachable
-through neither channel.
+The sidecar is needed so that context is not spoiled. Note that the held-out data (`protected/test.csv`, `protected/shadow.csv`) is reachable through neither channel.
 
 ## Running the server
 
@@ -62,9 +61,12 @@ data only — the working directory never contains `protected/`).
 - `run_id="…"` → `idata`: that run's posterior draws as an arviz
 `InferenceData` (plus the run's `model.stan` beside it).
 
-numpy, matplotlib (Agg) and arviz are available. Typical calls: EDA
-aggregates, `az.plot_ppc`, `az.plot_trace`, `az.loo(idata)`, prior-predictive
-envelopes. Errors return the traceback so the agent can fix its code and
+numpy, matplotlib (Agg) and arviz are available; `idata` is built for
+whichever arviz major is installed. Typical calls: EDA aggregates,
+`az.plot_trace`, `az.loo(idata)`, prior-predictive envelopes, and posterior
+predictive checks — note the PPC API differs by version (`az.plot_ppc` on
+arviz 0.x; `az.plot_ppc_dist` / `plot_ppc_interval` / `plot_ppc_pit` on 1.x),
+so check `az.__version__` or just plot the overlay by hand. Errors return the traceback so the agent can fix its code and
 retry. Leakage analysis and the benchmark prohibition:
 [TOOL_POLICY.md](../TOOL_POLICY.md).
 
@@ -101,6 +103,8 @@ to load the draws.
 
 - **Pre-staged dataset** (`tier: staged`): `fit_and_evaluate`
 - **Uploaded dataset** (`tier: uploaded`): `sample` → compute PSIS-LOO yourself
+
+
 
 ## HTTP sidecar endpoints
 
@@ -209,6 +213,8 @@ Run assets are stored under `<results-dir>/_runs/<run_id>/` and are never
 automatically deleted.
 
 ## Datasets
+
+
 
 ### Layout
 
@@ -339,6 +345,8 @@ stan-mcp-server \
   --token $(openssl rand -hex 32)   # save this token
 ```
 
+
+
 ### 2. Tunnel the ports via SSH
 
 ```bash
@@ -372,10 +380,17 @@ the agent can read logs and samples directly.
 }
 ```
 
+
+
 ## Security
 
-For remote deployments (i.e. `--host 0.0.0.0`) protect the server with a
-bearer token using the built-in `--token` flag, or set the environment
+The server runs arbitrary Stan code and accepts dataset uploads; the bearer
+token ensures only clients that know the secret can connect. Use it whenever
+the ports might be reachable beyond your machine (remote host, SSH tunnel, or
+`--host 0.0.0.0`). On a strictly local setup (`127.0.0.1`, no tunnel) it is
+optional.
+
+Protect the server with the built-in `--token` flag, or set the environment
 variable `STAN_MCP_TOKEN` (keeps the secret out of shell history):
 
 ```bash
@@ -392,6 +407,8 @@ curl -X POST http://<server-ip>:8766/dataset/my_experiment \
      -H "Authorization: Bearer <token>" \
      -F train=@train.csv
 ```
+
+
 
 ## Leakage model
 

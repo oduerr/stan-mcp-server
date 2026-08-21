@@ -437,10 +437,10 @@ def test_preamble_loads_draws_with_the_installed_arviz(tmp_path):
     assert "cols_is_none True" in proc.stdout        # no dataset requested
 
 
-def test_pinned_arviz_matches_the_documented_api():
-    """The docs and agent-written code target the 0.x API; the pin must hold."""
+def test_loader_covers_both_arviz_majors():
+    """Whichever major is installed, the preamble must have a path for it."""
     az = pytest.importorskip("arviz")
-    assert int(az.__version__.split(".")[0]) < 1, (
-        f"arviz {az.__version__} installed but pyproject pins <1 — the docs' "
-        "from_cmdstan/plot_ppc examples do not exist in 1.x"
-    )
+    major = int(az.__version__.split(".")[0])
+    assert hasattr(az, "from_cmdstan" if major < 1 else "from_cmdstanpy")
+    assert "from_cmdstan(" in srv._CODE_RUNNER_PREAMBLE          # arviz < 1 path
+    assert "from_cmdstanpy(" in srv._CODE_RUNNER_PREAMBLE        # arviz >= 1 path
