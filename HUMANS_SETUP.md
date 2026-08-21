@@ -32,7 +32,41 @@ CmdStan, once per machine — pass `cores`, the default builds single-threaded
 Already installed? `.venv/bin/python -c "import cmdstanpy; print(cmdstanpy.cmdstan_path())"`
 prints the path instead of raising.
 
-## Start the server
+## Simplest setup: Claude Desktop (no server to run)
+
+If you use Claude Desktop, you never start the server yourself — Desktop
+launches it for you over **stdio** and shuts it down with the app. After the
+install above, open Settings → Developer → Edit Config and add:
+
+```json
+{
+  "mcpServers": {
+    "stan": {
+      "command": "/absolute/path/to/stan-mcp-server/.venv/bin/stan-mcp-server",
+      "args": ["--transport", "stdio",
+               "--datasets-dir", "/absolute/path/to/stan-mcp-server/datasets",
+               "--results-dir", "/absolute/path/to/stan-mcp-server/results",
+               "--enable-code-tool"]
+    }
+  }
+}
+```
+
+All paths must be **absolute** (`pwd` in the cloned directory gives you the
+prefix). `--enable-code-tool` lets it return plots as images; leave it out for
+benchmark work. Quit Desktop completely and reopen it, then ask *"what Stan
+tools do you have?"* — it should list them.
+
+If something is wrong, Desktop writes this server's startup banner and errors
+to `~/Library/Logs/Claude/mcp-server-stan.log` (macOS) or
+`%APPDATA%\Claude\logs\` (Windows).
+
+Two consequences of stdio worth knowing: uploads happen by **copying files**
+into `<datasets-dir>/_uploaded/<name>/` (the agent asks the server where), and
+`--token` is refused — the client owns the process, so there is no network to
+authenticate. Details in [What stdio changes](#what-stdio-changes).
+
+## Start the server (other clients)
 
 ```bash
 stan-mcp-server \
@@ -108,6 +142,31 @@ offered to benchmark agents — see [TOOL_POLICY.md](TOOL_POLICY.md).
 withheld) — the tool behind prior/posterior predictive plots, trace plots and
 PSIS-LOO in clients that cannot execute code themselves (Claude Desktop).
 Assistant use only; see [TOOL_POLICY.md](TOOL_POLICY.md).
+
+## Connect your client
+
+**Claude Desktop** — stdio only for a local server; see
+[Simplest setup](#simplest-setup-claude-desktop-no-server-to-run) above.
+
+**Claude Code** — with the server already running (HTTP):
+
+```bash
+claude mcp add --transport http stan http://127.0.0.1:8765/mcp
+# with auth:  --header "Authorization: Bearer <token>"
+```
+
+**opencode** (`opencode.json`) and other URL-based clients:
+
+```json
+{
+  "mcp": {
+    "stan": { "type": "remote", "url": "http://127.0.0.1:8765/mcp", "enabled": true }
+  }
+}
+```
+
+Verify from the client by calling `get_capabilities` — it returns the tool
+list, the server version and the purpose line.
 
 ## Remote deployment
 
