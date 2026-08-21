@@ -1,4 +1,4 @@
-# AGENTS.md — install and operate the Stan MCP Server
+# AGENTS_SETUP.md — install and operate the Stan MCP Server
 
 You are an agent asked to install this server. Follow the steps in order.
 Each step has a verification — do not continue past a failed verification.
@@ -166,7 +166,13 @@ your human brings a CSV:
    on disk at `samples_path` — compute the comparison with a script:
    ```python
    import glob, arviz as az
-   idata = az.from_cmdstan(sorted(glob.glob("<samples_path>/samples/*.csv")))
+   csvs = sorted(glob.glob("<samples_path>/samples/*.csv"))
+   try:                                    # arviz < 1 (what the server pins)
+       idata = az.from_cmdstan(csvs, log_likelihood="log_lik")
+   except AttributeError:                  # arviz >= 1 removed from_cmdstan
+       from cmdstanpy import from_csv
+       idata = az.from_cmdstanpy(from_csv("<samples_path>/samples"),
+                                 log_likelihood="log_lik")
    print(az.loo(idata))
    ```
 4. **Show, don't only tell** (needs `--enable-code-tool`): use
