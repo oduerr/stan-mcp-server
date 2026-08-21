@@ -1,17 +1,18 @@
 <img src="assets/logo/stan-mcp-server.svg" width="110" align="right" alt="stan-mcp-server — plug in, and the chains stream out">
 
 # Stan MCP Server
--- 
+
+[![CI](https://github.com/oduerr/stan-mcp-server/actions/workflows/ci.yml/badge.svg)](https://github.com/oduerr/stan-mcp-server/actions/workflows/ci.yml)
 
 This is an MCP server for the [Stan](https://mc-stan.org) language. It takes a [Stan model](https://mc-stan.org/docs/stan-users-guide/) as input and does the sampling (MCMC via CmdStan). It returns the diagnostics of the sampling and, when the dataset has a held-out test set, the NLPD on it. It is designed to be used together with an LLM agent, like *Claude Code*, *OpenCode*, or a similar agent.
 
 **Ways to use it:**
 
-- *(work in progress)* **As a Stan assistant for your own work.** Let the agent upload your data, then write the model from your verbal description. It does the heavy lifting: fixes the compile errors, runs the sampling, and reports the diagnostics. Some workflows, we are going to support are in[docs/USE_CASES.md](docs/USE_CASES.md).
-- *(work in progress)* **As an improvement loop on your own data.** Starting from first model, iterate: check priors, compare variants with PSIS-LOO, and keep what predicts better.
-- **As the evaluation server of the [AutoStan](https://github.com/tidit-ch/autostan) project**, where an agent
-iterates against the NLPD on **held-out data** it never sees: 
-  - propose a model → fit → read the score → reason → propose a better one. This could look like:
+- *(work in progress)* **As a Stan assistant for your own work.** Let the agent upload your data, then write the model from your verbal description. It does the heavy lifting: fixes the compile errors, runs the sampling, and reports the diagnostics. The workflows we are working towards are collected in [docs/USE_CASES.md](docs/USE_CASES.md).
+- *(work in progress)* **As an improvement loop on your own data.** Starting from that first model, iterate: check priors, compare variants with PSIS-LOO, and keep what predicts better.
+- **As the evaluation server of the [AutoStan](https://github.com/tidit-ch/autostan) project**, where an agent iterates against the NLPD on **held-out data** it never sees: propose a model → fit → read the score → reason → propose a better one.
+
+This could look like:
 
 ```
 agent:  fit_and_evaluate(stan_code="…linear model…", dataset="benchmarks/regression_1d")
