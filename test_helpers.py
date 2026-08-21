@@ -10,6 +10,7 @@ Usage:
     pytest test_helpers.py
 """
 
+import json
 import sys
 from pathlib import Path
 
@@ -444,3 +445,54 @@ def test_loader_covers_both_arviz_majors():
     assert hasattr(az, "from_cmdstan" if major < 1 else "from_cmdstanpy")
     assert "from_cmdstan(" in srv._CODE_RUNNER_PREAMBLE          # arviz < 1 path
     assert "from_cmdstanpy(" in srv._CODE_RUNNER_PREAMBLE        # arviz >= 1 path
+
+
+# ── runs.jsonl — the index over _runs/ ─────────────────────────────────────────
+# Promise: no directory under _runs/ is ever anonymous. `sample` writes no
+# per-dataset log at all, so before this index its runs had no record anywhere
+# (39 orphans out of 528 dirs on the shared server when it was added).
+
+def _read_index(results_dir):
+    path = Path(results_dir) / "runs.jsonl"
+    if not path.exists():
+        return []
+    return [json.loads(l) for l in path.read_text().splitlines() if l.strip()]
+
+
+def test_run_index_entry_shape():
+    e = srv._run_index_entry("sample", "abc123abc123", Path("/r/_runs/abc123abc123"),
+                             dataset="_uploaded/x", status="ok", runtime_sec=1.5,
+                             n_draws=4000)
+    assert e["run_id"] == "abc123abc123" and e["tool"] == "sample"
+    assert e["dataset"] == "_uploaded/x" and e["status"] == "ok"
+    assert e["nlpd"] is None                      # sample has no held-out score
+    assert e["samples_path"].endswith("abc123abc123")
+    assert e["logs_path"].endswith("logs.txt")
+    assert e["timestamp"].endswith("+00:00")      # UTC, sortable
+    assert e["machine"]
+
+
+def test_run_index_appends_and_survives_bad_lines(tmp_path, monkeypatch):
+    monkeypatch.setattr(srv, "_RESULTS_DIR", tmp_path)
+    srv._append_run_index({"run_id": "a" * 12, "status": "ok"})
+    (tmp_path / "runs.jsonl").open("a").write("{ torn line\n")   # simulate a torn write
+    srv._append_run_index({"run_id": "b" * 12, "status": "ok"})
+    lines = [l for l in (tmp_path / "runs.jsonl").read_text().splitlines() if l.strip()]
+    assert len(lines) == 3
+    good = [json.loads(l) for l in lines if l.startswith("{\"")]
+    assert [g["run_id"] for g in good] == ["a" * 12, "b" * 12]   # JSONL degrades gracefully
+
+
+def test_run_index_never_fails_a_run(tmp_path, monkeypatch):
+    # An unwritable results dir must not raise into a fit that already worked.
+    monkeypatch.setattr(srv, "_RESULTS_DIR", tmp_path / "nope" / "\x00bad")
+    srv._append_run_index({"run_id": "c" * 12})    # must not raise
+
+
+def test_sample_indexes_its_run(tmp_path, monkeypatch):
+    """The gap this closes: sample() writes no per-dataset log."""
+    monkeypatch.setattr(srv, "_RESULTS_DIR", tmp_path)
+    monkeypatch.setattr(srv, "_DATASETS_DIR", tmp_path / "datasets")
+    r = srv.sample(stan_code="not stan code {{{", data={"N": 1})
+    assert r["status"] == "error"                  # compile fails: no run dir created
+    assert _read_index(tmp_path) == []             # ...so nothing to index

@@ -741,6 +741,49 @@ def _append_log(dataset: str, entry: dict) -> None:
         f.write(json.dumps(entry) + "\n")
 
 
+def _append_run_index(entry: dict) -> None:
+    """Append one line to <results-dir>/runs.jsonl — the index over _runs/.
+
+    OPERATOR-FACING ONLY.  No MCP tool reads this file: it spans datasets and
+    sessions, which is the L2 leak class get_run_history is withheld for (see
+    TOOL_POLICY.md).  Exposing it would need its own policy row.
+
+    Written by every tool that creates a run directory, including `sample`,
+    which logs nowhere else — without this, assistant-mode runs leave opaque
+    hex directories with no record of what they were.  JSONL, like the
+    per-dataset logs: free-text fields, tolerant of a torn line, and new keys
+    do not break old readers.
+
+    Never raises: an index failure must not fail a fit that already succeeded.
+    """
+    try:
+        path = _RESULTS_DIR / "runs.jsonl"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with open(path, "a") as f:
+            f.write(json.dumps(entry) + "\n")
+    except Exception as exc:          # noqa: BLE001
+        logging.warning("could not write run index: %s", exc)
+
+
+def _run_index_entry(tool: str, run_id: str, run_dir: Path, *, dataset=None,
+                     status: str, runtime_sec=None, nlpd=None, n_draws=None) -> dict:
+    """Build the index line.  Timestamps are UTC ISO-8601 (sortable)."""
+    from datetime import datetime, timezone  # noqa: PLC0415
+    return {
+        "run_id": run_id,
+        "timestamp": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        "tool": tool,
+        "dataset": dataset,
+        "status": status,
+        "runtime_sec": runtime_sec,
+        "nlpd": nlpd,                       # None for `sample` — no held-out score
+        "n_draws": n_draws,
+        "machine": socket.gethostname(),
+        "logs_path": str(run_dir / "logs.txt"),
+        "samples_path": str(run_dir),
+    }
+
+
 # ── Shadow containment ─────────────────────────────────────────────────────────
 # `shadow_nlpd` is written into log.jsonl on purpose — the shadow measurement is
 # useless if it isn't recorded — but it must never reach the model.  The moment
@@ -788,11 +831,16 @@ _TIMEOUT_MESSAGE = (
 )
 
 
-def _compile_and_sample(stan_code: str, data: dict, config: Optional[dict]) -> dict:
+def _compile_and_sample(stan_code: str, data: dict, config: Optional[dict],
+                        tool: str = "sample", dataset: Optional[str] = None) -> dict:
     """Compile, sample with the wall-clock guard, and persist run assets.
 
     Returns {"error": <result dict ready to return to the model>} on failure, or
     {"model", "fit", "run_id", "run_dir", "runtime_sec", "cfg"} on success.
+
+    ``tool`` / ``dataset`` are recorded in the run index (runs.jsonl) — failures
+    that got as far as creating a run directory are indexed too, so no directory
+    under _runs/ is ever anonymous.
     """
     try:
         model = _get_model(stan_code)
@@ -825,6 +873,9 @@ def _compile_and_sample(stan_code: str, data: dict, config: Optional[dict]) -> d
             (run_dir / "logs.txt").write_text(log_buf.getvalue())
             # Returned as a normal error, not raised: the agent should learn
             # "too slow, simplify" and keep iterating.
+            _append_run_index(_run_index_entry(
+                tool, run_id, run_dir, dataset=dataset, status="sampling_timeout",
+                runtime_sec=cfg["max_runtime_sec"]))
             return {"error": {
                 "status": "error",
                 "stage": "sampling_timeout",
@@ -834,6 +885,9 @@ def _compile_and_sample(stan_code: str, data: dict, config: Optional[dict]) -> d
             }}
         except Exception as exc:
             (run_dir / "logs.txt").write_text(log_buf.getvalue())
+            _append_run_index(_run_index_entry(
+                tool, run_id, run_dir, dataset=dataset, status="sampling_error",
+                runtime_sec=round(time.time() - t0, 1)))
             return {"error": {"status": "error", "stage": "sampling",
                               "message": str(exc)[:500]}}
     (run_dir / "logs.txt").write_text(log_buf.getvalue())
@@ -982,7 +1036,8 @@ def fit_and_evaluate(
     if not re.search(r'\blog_lik\b', stan_code):
         return {"status": "error", "stage": "missing_log_lik", "message": "no 'log_lik' found in stan_code — required for NLPD computation"}
 
-    run = _compile_and_sample(stan_code, data, config)
+    run = _compile_and_sample(stan_code, data, config,
+                              tool="fit_and_evaluate", dataset=dataset)
     if "error" in run:
         return run["error"]
     model, fit = run["model"], run["fit"]
@@ -990,6 +1045,9 @@ def fit_and_evaluate(
 
     all_vars = fit.stan_variables()
     if "log_lik" not in all_vars:
+        _append_run_index(_run_index_entry(
+            "fit_and_evaluate", run_id, run_dir, dataset=dataset,
+            status="missing_log_lik", runtime_sec=runtime_sec))
         return {"status": "error", "stage": "missing_log_lik", "message": "'log_lik' not found in generated quantities output"}
 
     log_lik = np.asarray(all_vars["log_lik"])
@@ -998,6 +1056,9 @@ def fit_and_evaluate(
 
     n_test = len(y_test) if y_test is not None else log_lik.shape[1]
     if y_test is not None and log_lik.shape[1] != n_test:
+        _append_run_index(_run_index_entry(
+            "fit_and_evaluate", run_id, run_dir, dataset=dataset,
+            status="log_lik_shape_mismatch", runtime_sec=runtime_sec))
         return {"status": "error", "stage": "missing_log_lik", "message": f"log_lik has {log_lik.shape[1]} columns but y_test has {n_test} elements"}
 
     nlpd = _compute_nlpd(log_lik)
@@ -1095,6 +1156,11 @@ def fit_and_evaluate(
         except Exception:
             shadow_nlpd = None      # never fail an evaluation over the shadow pass
 
+    _append_run_index(_run_index_entry(
+        "fit_and_evaluate", run_id, run_dir, dataset=dataset, status=result_status,
+        runtime_sec=runtime_sec, nlpd=result["nlpd"],
+        n_draws=run["cfg"]["chains"] * run["cfg"]["iter_sampling"]))
+
     if dataset is not None:
         existing = _read_log(dataset)
         iter_num = len(existing)
@@ -1165,12 +1231,17 @@ def sample(
         return {"status": "error", "stage": "input",
                 "message": "Either 'dataset' or 'data' must be provided."}
 
-    run = _compile_and_sample(stan_code, data, config)
+    run = _compile_and_sample(stan_code, data, config,
+                              tool="sample", dataset=dataset)
     if "error" in run:
         return run["error"]
     fit, cfg, run_dir = run["fit"], run["cfg"], run["run_dir"]
 
     diag, param_summary, sampler_detail = _safe_fit_summaries(fit)
+
+    _append_run_index(_run_index_entry(
+        "sample", run["run_id"], run_dir, dataset=dataset, status="ok",
+        runtime_sec=run["runtime_sec"], n_draws=cfg["chains"] * cfg["iter_sampling"]))
 
     return {
         "status": "ok",
