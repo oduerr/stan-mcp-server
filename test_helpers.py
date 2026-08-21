@@ -402,3 +402,45 @@ def test_diagnostic_flags_fire_per_problem():
     assert "chain 1 (0.15)" in text and "chain 3" not in text   # nan not flagged
     assert "tau (1.08)" in text and "mu (1.001)" not in text
     assert "theta[3] (42)" in text
+
+
+# ── Code-runner preamble vs the installed arviz ────────────────────────────────
+# Regression: the preamble called az.from_cmdstan, which arviz >= 1 removed.
+# arviz 1.x needs Python >= 3.12, so a fresh install silently differed by
+# interpreter version and every run_python_code(run_id=...) call died before
+# the agent's own code ran. Exercised against real CmdStan CSVs so it runs in
+# CI without CmdStan itself.
+
+FIXTURE_SAMPLES = Path(__file__).parent / "tests" / "fixtures" / "mini_run" / "samples"
+
+
+def test_preamble_loads_draws_with_the_installed_arviz(tmp_path):
+    pytest.importorskip("arviz")
+    assert FIXTURE_SAMPLES.is_dir(), "fixture CSVs missing"
+    import shutil
+    import subprocess
+
+    shutil.copytree(FIXTURE_SAMPLES, tmp_path / "samples")
+    (tmp_path / "runner.py").write_text(
+        srv._CODE_RUNNER_PREAMBLE
+        + "import arviz as az\n"
+          "print('arviz', az.__version__)\n"
+          "print('vars', sorted(idata.posterior.data_vars))\n"
+          "print('has_log_lik_group', hasattr(idata, 'log_likelihood'))\n"
+          "print('cols_is_none', cols is None)\n"
+    )
+    proc = subprocess.run([sys.executable, "-I", "runner.py"], cwd=tmp_path,
+                          capture_output=True, text=True, timeout=180)
+    assert proc.returncode == 0, proc.stderr[-1500:]
+    assert "'mu'" in proc.stdout and "'sigma'" in proc.stdout
+    assert "has_log_lik_group True" in proc.stdout   # az.loo needs its own group
+    assert "cols_is_none True" in proc.stdout        # no dataset requested
+
+
+def test_loader_covers_both_arviz_majors():
+    """Whichever major is installed, the preamble must have a path for it."""
+    az = pytest.importorskip("arviz")
+    major = int(az.__version__.split(".")[0])
+    assert hasattr(az, "from_cmdstan" if major < 1 else "from_cmdstanpy")
+    assert "from_cmdstan(" in srv._CODE_RUNNER_PREAMBLE          # arviz < 1 path
+    assert "from_cmdstanpy(" in srv._CODE_RUNNER_PREAMBLE        # arviz >= 1 path

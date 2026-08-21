@@ -1,30 +1,17 @@
-# Stan MCP Server
-
 <img src="assets/logo/stan-mcp-server.svg" width="110" align="right" alt="stan-mcp-server — plug in, and the chains stream out">
 
-This is an MCP server for the [Stan](https://mc-stan.org) language. It takes
-a [Stan model](https://mc-stan.org/docs/stan-users-guide/) as input and does
-the sampling (MCMC via CmdStan). It returns the diagnostics of the sampling
-and, when the dataset has a held-out test set, the NLPD on it. It is designed
-to be used together with an LLM agent, like Claude Code, OpenCode, or a
-similar agent.
+# Stan MCP Server
+-- 
+
+This is an MCP server for the [Stan](https://mc-stan.org) language. It takes a [Stan model](https://mc-stan.org/docs/stan-users-guide/) as input and does the sampling (MCMC via CmdStan). It returns the diagnostics of the sampling and, when the dataset has a held-out test set, the NLPD on it. It is designed to be used together with an LLM agent, like *Claude Code*, *OpenCode*, or a similar agent.
 
 **Ways to use it:**
 
-- *(work in progress)* **As a Stan assistant for your own work.** Let the
-  agent upload your data, then write the model from your description. It does
-  the dirty work: fixes the compile errors, runs the sampling, and reports
-  the diagnostics. The workflows we are building toward are collected in
-  [docs/USE_CASES.md](docs/USE_CASES.md).
-
-- *(work in progress)* **As an improvement loop on your own data.** Starting
-  from that first model, iterate: check priors, compare variants with
-  PSIS-LOO, and keep what predicts better.
-
-- **As the evaluation server of the
-  [AutoStan](https://github.com/tidit-ch/autostan) project**, where an agent
-  iterates against the NLPD on **held-out data** it can never see: propose a
-  model → fit → read the score → reason → propose a better one.
+- *(work in progress)* **As a Stan assistant for your own work.** Let the agent upload your data, then write the model from your verbal description. It does the heavy lifting: fixes the compile errors, runs the sampling, and reports the diagnostics. Some workflows, we are going to support are in[docs/USE_CASES.md](docs/USE_CASES.md).
+- *(work in progress)* **As an improvement loop on your own data.** Starting from first model, iterate: check priors, compare variants with PSIS-LOO, and keep what predicts better.
+- **As the evaluation server of the [AutoStan](https://github.com/tidit-ch/autostan) project**, where an agent
+iterates against the NLPD on **held-out data** it never sees: 
+  - propose a model → fit → read the score → reason → propose a better one. This could look like:
 
 ```
 agent:  fit_and_evaluate(stan_code="…linear model…", dataset="benchmarks/regression_1d")
@@ -38,24 +25,19 @@ server: {"nlpd": 1.17, …}          ← oracle for this dataset: 0.94
 
 ## Next steps depending on...
 
-| You are… | Do this |
-|---|---|
-| 🙂 **Non-technical** — you use Claude Code, opencode, or a similar agent | Copy the prompt below into your agent and watch |
-| 🤖 **An agent** told to set this up | Read [AGENTS.md](AGENTS.md) and follow it step by step |
-| 🔧 **Technically curious** | [docs/REFERENCE.md](docs/REFERENCE.md) for the full surface, [TOOL_POLICY.md](TOOL_POLICY.md) for the leakage model |
+
+| You are…                                                                 | Do this                                                                                                             |
+| ------------------------------------------------------------------------ | ------------------------------------------------------------------------------------------------------------------- |
+| 🙂 **Non-technical** — you use Claude Code, opencode, or a similar agent | Copy the prompt below into your agent and watch                                                                     |
+| 🤖 **An agent** told to set this up                                      | Read [AGENTS_SETUP.md](AGENTS_SETUP.md) and follow it step by step                                                        |
+| 🔧 **Technically curious**                                               | [docs/REFERENCE.md](docs/REFERENCE.md) for the full surface, [TOOL_POLICY.md](TOOL_POLICY.md) for the leakage model |
+
 
 ### The copy-paste prompt
 
-> Read https://github.com/oduerr/stan-mcp-server/blob/main/AGENTS.md and
-> follow it: install the Stan MCP server on this machine, verify it works,
-> register it, then run the demo — fit a Bayesian model to the bundled
-> `benchmarks/regression_1d` dataset, improve it once, and explain the result
-> to me in plain language.
+> Read [https://github.com/oduerr/stan-mcp-server/blob/main/AGENTS_SETUP.md](https://github.com/oduerr/stan-mcp-server/blob/main/AGENTS_SETUP.md) and follow it: install the Stan MCP server on this machine, verify it works, register it, then run the demo, fit a Bayesian model to the bundled `benchmarks/regression_1d` dataset, improve it once, and explain the result to me in plain language. Plot the posterior predictive.
 
-Your agent will install everything (Python environment, plus a one-time
-CmdStan build — under a minute on a modern laptop with a parallel build,
-longer on older hardware), start the server, and walk you through a
-model-improvement loop like the transcript above.
+Your agent will install everything (Python environment, plus a one-time CmdStan build, if not installed), start the server, and walk you through a model-improvement loop like the transcript above.
 
 **Then bring your own data.** Once the server is installed, this works too:
 
@@ -63,6 +45,8 @@ model-improvement loop like the transcript above.
 > to the Stan MCP server, look at the data summary, propose a model, fit it,
 > and compare a couple of variants with PSIS-LOO. Explain your choices as
 > you go.
+
+For further examples, see docs/USE_CASES.md
 
 ## Quick start (technical humans)
 
@@ -81,13 +65,13 @@ tools, dataset conventions, uploads, remote deployment, auth — is in
 ## What the agent gets
 
 - `fit_and_evaluate` — the core loop: Stan code in, held-out NLPD +
-  diagnostics out
+diagnostics out
 - `get_data_summary` — compact per-column statistics, never raw rows
 - `check_model`, `sample`, `list_datasets`, `get_capabilities`,
-  `get_upload_instructions`
+`get_upload_instructions`
 - `GET /train/{dataset}` on the sidecar — clients that run code locally can
-  download `train.csv` **to disk** and do real EDA without the data passing
-  through the model's context
+download `train.csv` **to disk** and do real EDA without the data passing
+through the model's context
 
 ## The safety model, in three sentences
 

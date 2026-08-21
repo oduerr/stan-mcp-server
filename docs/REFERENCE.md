@@ -1,8 +1,10 @@
 # Reference
 
-The complete technical documentation for the Stan MCP Server. For a first start, read the [README](../README.md); for installation, read
-[AGENTS.md](../AGENTS.md); for the leakage model and the permitted agent tool
-surface, [TOOL_POLICY.md](../TOOL_POLICY.md) is authoritative.
+For a first start, read the
+
+- [README](../README.md) for installation  
+- [AGENTS_SETUP.md](../AGENTS_SETUP.md) how to install the server-
+- [TOOL_POLICY.md](../TOOL_POLICY.md) for the leakage model and the permitted agent
 
 ## Architecture
 
@@ -23,8 +25,7 @@ Two channels, deliberately separate:
 | HTTP sidecar (port 8766) | bulk bytes: dataset uploads, train downloads | no — client ↔ server directly |
 
 
-Held-out data (`protected/test.csv`, `protected/shadow.csv`) is reachable
-through neither channel.
+The sidecar is needed so that context is not spoiled. Note that the held-out data (`protected/test.csv`, `protected/shadow.csv`) is reachable through neither channel.
 
 ## Running the server
 
@@ -56,13 +57,16 @@ in an isolated subprocess and answer with capped stdout **plus every saved
 to 4 per call, 60 s default / 120 s max wall clock). Preloaded names:
 
 - `dataset="…"` → `cols`: dict of train.csv columns as numpy arrays (train
-  data only — the working directory never contains `protected/`).
+data only — the working directory never contains `protected/`).
 - `run_id="…"` → `idata`: that run's posterior draws as an arviz
-  `InferenceData` (plus the run's `model.stan` beside it).
+`InferenceData` (plus the run's `model.stan` beside it).
 
-numpy, matplotlib (Agg) and arviz are available. Typical calls: EDA
-aggregates, `az.plot_ppc`, `az.plot_trace`, `az.loo(idata)`, prior-predictive
-envelopes. Errors return the traceback so the agent can fix its code and
+numpy, matplotlib (Agg) and arviz are available; `idata` is built for
+whichever arviz major is installed. Typical calls: EDA aggregates,
+`az.plot_trace`, `az.loo(idata)`, prior-predictive envelopes, and posterior
+predictive checks — note the PPC API differs by version (`az.plot_ppc` on
+arviz 0.x; `az.plot_ppc_dist` / `plot_ppc_interval` / `plot_ppc_pit` on 1.x),
+so check `az.__version__` or just plot the overlay by hand. Errors return the traceback so the agent can fix its code and
 retry. Leakage analysis and the benchmark prohibition:
 [TOOL_POLICY.md](../TOOL_POLICY.md).
 
@@ -71,8 +75,6 @@ retry. Leakage analysis and the benchmark prohibition:
 Which of these a **benchmark agent** may be offered — and which leak — is
 specified in [TOOL_POLICY.md](../TOOL_POLICY.md). The table below is the full
 server surface, not the permitted agent surface.
-
-
 
 Where the table says **run asset paths**, it means the two fields
 `logs_path` (the CmdStan console log, a text file) and `samples_path` (the
@@ -83,18 +85,16 @@ contents — are returned, so the agent (or you) can open them on disk; see
 to load the draws.
 
 
-
-
-| Tool                      | Purpose                                                                                                                                     |
-| ------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------- |
-| `get_capabilities`        | Tool list (from the live registry), server version and configuration, upload and train-download URLs                                        |
-| `list_datasets`           | List pre-staged and uploaded datasets                                                                                                       |
-| `get_data_summary`        | Compact EDA for a named dataset: per-column stats (categorical columns summarized by levels), `tier`, `has_test`, `dataset_md`, `train_url` |
-| `check_model`             | Compile-only check (syntax + `log_lik` presence)                                                                                            |
-| `fit_and_evaluate`        | Sample + compute NLPD on the held-out test set; pre-staged datasets only                                                                    |
-| `sample`                  | Sample; loads data by dataset name (incl. train-only uploaded datasets) and/or inline `data`; returns scalar diagnostics + run asset paths  |
-| `get_upload_instructions` | HTTP upload URL and field names for datasets                                                                                                |
-| `get_run_history`         | Logged NLPD history for a dataset — ⚠️ cross-session; withheld unless `--include-run-history`                                               |
+| Tool                      | Purpose                                                                                                                                                                        |
+| ------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `get_capabilities`        | Tool list (from the live registry), server version and configuration, upload and train-download URLs                                                                           |
+| `list_datasets`           | List pre-staged and uploaded datasets                                                                                                                                          |
+| `get_data_summary`        | Compact EDA for a named dataset: per-column stats (categorical columns summarized by levels), `tier`, `has_test`, `dataset_md`, `train_url`                                    |
+| `check_model`             | Compile-only check (syntax + `log_lik` presence)                                                                                                                               |
+| `fit_and_evaluate`        | Sample + compute NLPD on the held-out test set; pre-staged datasets only                                                                                                       |
+| `sample`                  | Sample; loads data by dataset name (incl. train-only uploaded datasets) and/or inline `data`; returns scalar diagnostics + run asset paths                                     |
+| `get_upload_instructions` | HTTP upload URL and field names for datasets                                                                                                                                   |
+| `get_run_history`         | Logged NLPD history for a dataset — ⚠️ cross-session; withheld unless `--include-run-history`                                                                                  |
 | `run_python_code`         | Execute analysis code server-side with `cols` (train columns) and/or `idata` (a run's draws) preloaded; figures return as MCP images — ⚠️ withheld unless `--enable-code-tool` |
 
 
@@ -159,7 +159,7 @@ forever; a timeout is returned to the agent as a normal error
 
 Every fit returns two layers. The **core scalars** (`n_divergences`,
 `r_hat_max`, `ess_bulk_min`) answer "is this run valid" and feed the
-benchmark validity gate. The **`sampler_diagnostics` block** answers "what
+benchmark validity gate. The `sampler_diagnostics` **block** answers "what
 went wrong where":
 
 ```json
@@ -384,8 +384,13 @@ the agent can read logs and samples directly.
 
 ## Security
 
-For remote deployments (i.e. `--host 0.0.0.0`) protect the server with a
-bearer token using the built-in `--token` flag, or set the environment
+The server runs arbitrary Stan code and accepts dataset uploads; the bearer
+token ensures only clients that know the secret can connect. Use it whenever
+the ports might be reachable beyond your machine (remote host, SSH tunnel, or
+`--host 0.0.0.0`). On a strictly local setup (`127.0.0.1`, no tunnel) it is
+optional.
+
+Protect the server with the built-in `--token` flag, or set the environment
 variable `STAN_MCP_TOKEN` (keeps the secret out of shell history):
 
 ```bash

@@ -86,7 +86,7 @@ Agent: fits both with `log_lik` on the *training* data → computes PSIS-LOO
 (`az.loo`) from the on-disk draws → reports elpd difference ± SE and the
 Pareto-k health check.
 
-**Verdict: ✅** — coding agents compute LOO locally (AGENTS.md step 7);
+**Verdict: ✅** — coding agents compute LOO locally (AGENTS_SETUP.md step 7);
 every other client via `run_python_code(run_id=…)` with `az.loo(idata)`.
 
 ## UC-7 · Hierarchical model on grouped data

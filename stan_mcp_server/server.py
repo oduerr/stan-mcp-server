@@ -1449,12 +1449,31 @@ def _load_cols(path):
     return out
 
 
-cols = _load_cols("train.csv") if os.path.exists("train.csv") else None
-if os.path.isdir("samples"):
+def _load_idata(samples_dir):
+    """Build an InferenceData from CmdStan CSVs, across arviz versions.
+
+    arviz < 1 has from_cmdstan(paths); arviz >= 1 removed it (it requires
+    Python >= 3.12, so environments differ by interpreter version) and takes a
+    cmdstanpy fit through from_cmdstanpy.  Passing log_likelihood explicitly
+    puts log_lik in its own group, which az.loo needs on both.
+    """
     import arviz as az
-    idata = az.from_cmdstan(sorted(glob.glob("samples/*.csv")))
-else:
-    idata = None
+    if hasattr(az, "from_cmdstan"):                       # arviz < 1
+        csvs = sorted(glob.glob(os.path.join(samples_dir, "*.csv")))
+        try:
+            return az.from_cmdstan(csvs, log_likelihood="log_lik")
+        except Exception:
+            return az.from_cmdstan(csvs)                  # no log_lik in this model
+    from cmdstanpy import from_csv                        # arviz >= 1
+    fit = from_csv(samples_dir)
+    try:
+        return az.from_cmdstanpy(fit, log_likelihood="log_lik")
+    except Exception:
+        return az.from_cmdstanpy(fit)
+
+
+cols = _load_cols("train.csv") if os.path.exists("train.csv") else None
+idata = _load_idata("samples") if os.path.isdir("samples") else None
 
 # ── agent-written code below ──────────────────────────────────────────────────
 '''
@@ -1481,8 +1500,10 @@ def run_python_code(
     .png in the working directory (or via plt.savefig) is returned as an
     image, up to 4 per call.  Never print raw data rows.
 
-    Typical uses: EDA on the train columns, prior/posterior predictive plots
-    (az.plot_ppc), trace plots (az.plot_trace), PSIS-LOO (az.loo(idata)).
+    Typical uses: EDA on the train columns, prior/posterior predictive plots,
+    trace plots (az.plot_trace), PSIS-LOO (az.loo(idata)).  The arviz PPC API
+    differs by major version (az.plot_ppc on 0.x; az.plot_ppc_dist and friends
+    on 1.x) — check az.__version__, or plot the overlay yourself.
 
     The code runs in an isolated working directory containing only the
     requested files, with a wall-clock limit (default 60 s, max 120 s).
