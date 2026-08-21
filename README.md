@@ -33,6 +33,7 @@ server: {"nlpd": 1.17, …}          ← oracle for this dataset: 0.94
 | ------------------------------------------------------------------------ | ------------------------------------------------------------------------------------------------------------------- |
 | 🙂 **Non-technical** — you use Claude Code, opencode, or a similar agent | Copy the prompt below into your agent and watch                                                                     |
 | 🤖 **An agent** told to set this up                                      | Read [AGENTS_SETUP.md](AGENTS_SETUP.md) and follow it step by step                                                        |
+| 🛠️ **Running the server yourself** | [HUMANS_SETUP.md](HUMANS_SETUP.md) — install, transports, remote setups, auth |
 | 🔧 **Technically curious**                                               | [docs/REFERENCE.md](docs/REFERENCE.md) for the full surface, [TOOL_POLICY.md](TOOL_POLICY.md) for the leakage model |
 
 
@@ -64,7 +65,7 @@ uv venv && uv pip install -e .
 .venv/bin/stan-mcp-server --datasets-dir datasets --results-dir results
 ```
 
-Connecting from Claude Desktop, or running the server on another machine? See *How to connect* in [docs/REFERENCE.md](docs/REFERENCE.md) — five topologies with recommendations.
+Connecting from Claude Desktop, or running the server on another machine? See *How to connect* in [HUMANS_SETUP.md](HUMANS_SETUP.md) — five topologies with recommendations.
 
 MCP endpoint: `http://127.0.0.1:8765/mcp` · HTTP sidecar: port 8766 ·
 verify with `.venv/bin/python test_server_http.py`. Everything else —

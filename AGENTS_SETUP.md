@@ -98,7 +98,7 @@ curl -s http://127.0.0.1:8766/train/benchmarks/regression_1d | head -2
 
 Pick the client your human uses. For remote servers, or to see all five
 topologies with recommendations, read *How to connect* in
-[docs/REFERENCE.md](docs/REFERENCE.md).
+[HUMANS_SETUP.md](HUMANS_SETUP.md).
 
 **Claude Code:**
 
