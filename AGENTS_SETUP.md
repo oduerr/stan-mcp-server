@@ -96,7 +96,9 @@ curl -s http://127.0.0.1:8766/train/benchmarks/regression_1d | head -2
 
 ## 5. Register the server with the MCP client
 
-Pick the client your human uses:
+Pick the client your human uses. For remote servers, or to see all five
+topologies with recommendations, read *How to connect* in
+[docs/REFERENCE.md](docs/REFERENCE.md).
 
 **Claude Code:**
 

@@ -57,6 +57,8 @@ uv venv && uv pip install -e .
 .venv/bin/stan-mcp-server --datasets-dir datasets --results-dir results
 ```
 
+Connecting from Claude Desktop, or running the server on another machine? See *How to connect* in [docs/REFERENCE.md](docs/REFERENCE.md) — five topologies with recommendations.
+
 MCP endpoint: `http://127.0.0.1:8765/mcp` · HTTP sidecar: port 8766 ·
 verify with `.venv/bin/python test_server_http.py`. Everything else —
 tools, dataset conventions, uploads, remote deployment, auth — is in
