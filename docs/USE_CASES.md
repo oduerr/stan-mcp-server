@@ -13,6 +13,10 @@ a test under `tests/use_cases/` (one scripted, LLM-free test per use case —
 so this document cannot drift from reality; see Incident 2 in
 [TOOL_POLICY.md](../TOOL_POLICY.md) for why that matters).
 
+Prompts that have actually been run against the server live in
+[DEMO_PROMPTS.md](DEMO_PROMPTS.md) — this file is the spec, that one is the
+record.
+
 Status of this collection: **draft — extend and edit freely.**
 
 ---

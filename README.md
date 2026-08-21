@@ -40,6 +40,10 @@ server: {"nlpd": 1.17, …}          ← oracle for this dataset: 0.94
 
 Your agent will install everything (Python environment, plus a one-time CmdStan build, if not installed), start the server, and walk you through a model-improvement loop like the transcript above.
 
+More copy-paste prompts that have actually been run — including a real-data
+football attack/defence analysis — are in
+[docs/DEMO_PROMPTS.md](docs/DEMO_PROMPTS.md).
+
 **Then bring your own data.** Once the server is installed, this works too:
 
 > I have my data in `sales.csv` and want a Bayesian model for it. Upload it
