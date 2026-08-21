@@ -13,7 +13,12 @@ dependencies = [
     "numpy>=1.24",
     "scipy>=1.10",
     "matplotlib>=3.7",
-    "arviz>=0.17",
+    # arviz 1.x is a backward-incompatible refactor (from_cmdstan and
+    # plot_ppc removed) and requires Python >=3.12, so an unpinned
+    # install silently differs by interpreter version. The code tool and
+    # every documented example target the 0.x API; 0.23.x installs on
+    # 3.10-3.13. Revisit as a deliberate migration, not a resolver accident.
+    "arviz>=0.17,<1",
 ]
 
 [project.optional-dependencies]

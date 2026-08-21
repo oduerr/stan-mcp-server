@@ -1,8 +1,10 @@
 # Reference
 
-The complete technical documentation for the Stan MCP Server. For a first start, read the [README](../README.md); for installation, read
-[AGENTS.md](../AGENTS.md); for the leakage model and the permitted agent tool
-surface, [TOOL_POLICY.md](../TOOL_POLICY.md) is authoritative.
+For a first start, read the
+
+- [README](../README.md) for installation  
+- [AGENTS_SETUP.md](../AGENTS_SETUP.md) how to install the server-
+- [TOOL_POLICY.md](../TOOL_POLICY.md) for the leakage model and the permitted agent 
 
 ## Architecture
 
@@ -56,9 +58,9 @@ in an isolated subprocess and answer with capped stdout **plus every saved
 to 4 per call, 60 s default / 120 s max wall clock). Preloaded names:
 
 - `dataset="…"` → `cols`: dict of train.csv columns as numpy arrays (train
-  data only — the working directory never contains `protected/`).
+data only — the working directory never contains `protected/`).
 - `run_id="…"` → `idata`: that run's posterior draws as an arviz
-  `InferenceData` (plus the run's `model.stan` beside it).
+`InferenceData` (plus the run's `model.stan` beside it).
 
 numpy, matplotlib (Agg) and arviz are available. Typical calls: EDA
 aggregates, `az.plot_ppc`, `az.plot_trace`, `az.loo(idata)`, prior-predictive
@@ -72,8 +74,6 @@ Which of these a **benchmark agent** may be offered — and which leak — is
 specified in [TOOL_POLICY.md](../TOOL_POLICY.md). The table below is the full
 server surface, not the permitted agent surface.
 
-
-
 Where the table says **run asset paths**, it means the two fields
 `logs_path` (the CmdStan console log, a text file) and `samples_path` (the
 run directory holding `model.stan` plus one posterior-draw CSV per chain).
@@ -83,18 +83,16 @@ contents — are returned, so the agent (or you) can open them on disk; see
 to load the draws.
 
 
-
-
-| Tool                      | Purpose                                                                                                                                     |
-| ------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------- |
-| `get_capabilities`        | Tool list (from the live registry), server version and configuration, upload and train-download URLs                                        |
-| `list_datasets`           | List pre-staged and uploaded datasets                                                                                                       |
-| `get_data_summary`        | Compact EDA for a named dataset: per-column stats (categorical columns summarized by levels), `tier`, `has_test`, `dataset_md`, `train_url` |
-| `check_model`             | Compile-only check (syntax + `log_lik` presence)                                                                                            |
-| `fit_and_evaluate`        | Sample + compute NLPD on the held-out test set; pre-staged datasets only                                                                    |
-| `sample`                  | Sample; loads data by dataset name (incl. train-only uploaded datasets) and/or inline `data`; returns scalar diagnostics + run asset paths  |
-| `get_upload_instructions` | HTTP upload URL and field names for datasets                                                                                                |
-| `get_run_history`         | Logged NLPD history for a dataset — ⚠️ cross-session; withheld unless `--include-run-history`                                               |
+| Tool                      | Purpose                                                                                                                                                                        |
+| ------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `get_capabilities`        | Tool list (from the live registry), server version and configuration, upload and train-download URLs                                                                           |
+| `list_datasets`           | List pre-staged and uploaded datasets                                                                                                                                          |
+| `get_data_summary`        | Compact EDA for a named dataset: per-column stats (categorical columns summarized by levels), `tier`, `has_test`, `dataset_md`, `train_url`                                    |
+| `check_model`             | Compile-only check (syntax + `log_lik` presence)                                                                                                                               |
+| `fit_and_evaluate`        | Sample + compute NLPD on the held-out test set; pre-staged datasets only                                                                                                       |
+| `sample`                  | Sample; loads data by dataset name (incl. train-only uploaded datasets) and/or inline `data`; returns scalar diagnostics + run asset paths                                     |
+| `get_upload_instructions` | HTTP upload URL and field names for datasets                                                                                                                                   |
+| `get_run_history`         | Logged NLPD history for a dataset — ⚠️ cross-session; withheld unless `--include-run-history`                                                                                  |
 | `run_python_code`         | Execute analysis code server-side with `cols` (train columns) and/or `idata` (a run's draws) preloaded; figures return as MCP images — ⚠️ withheld unless `--enable-code-tool` |
 
 
@@ -103,8 +101,6 @@ to load the draws.
 
 - **Pre-staged dataset** (`tier: staged`): `fit_and_evaluate`
 - **Uploaded dataset** (`tier: uploaded`): `sample` → compute PSIS-LOO yourself
-
-
 
 ## HTTP sidecar endpoints
 
@@ -159,7 +155,7 @@ forever; a timeout is returned to the agent as a normal error
 
 Every fit returns two layers. The **core scalars** (`n_divergences`,
 `r_hat_max`, `ess_bulk_min`) answer "is this run valid" and feed the
-benchmark validity gate. The **`sampler_diagnostics` block** answers "what
+benchmark validity gate. The `sampler_diagnostics` **block** answers "what
 went wrong where":
 
 ```json
@@ -213,8 +209,6 @@ Run assets are stored under `<results-dir>/_runs/<run_id>/` and are never
 automatically deleted.
 
 ## Datasets
-
-
 
 ### Layout
 
@@ -345,8 +339,6 @@ stan-mcp-server \
   --token $(openssl rand -hex 32)   # save this token
 ```
 
-
-
 ### 2. Tunnel the ports via SSH
 
 ```bash
@@ -380,8 +372,6 @@ the agent can read logs and samples directly.
 }
 ```
 
-
-
 ## Security
 
 For remote deployments (i.e. `--host 0.0.0.0`) protect the server with a
@@ -402,8 +392,6 @@ curl -X POST http://<server-ip>:8766/dataset/my_experiment \
      -H "Authorization: Bearer <token>" \
      -F train=@train.csv
 ```
-
-
 
 ## Leakage model
 

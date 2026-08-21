@@ -1449,12 +1449,31 @@ def _load_cols(path):
     return out
 
 
-cols = _load_cols("train.csv") if os.path.exists("train.csv") else None
-if os.path.isdir("samples"):
+def _load_idata(samples_dir):
+    """Build an InferenceData from CmdStan CSVs, across arviz versions.
+
+    arviz < 1 has from_cmdstan(paths); arviz >= 1 removed it (it requires
+    Python >= 3.12, so environments differ by interpreter version) and takes a
+    cmdstanpy fit through from_cmdstanpy.  Passing log_likelihood explicitly
+    puts log_lik in its own group, which az.loo needs on both.
+    """
     import arviz as az
-    idata = az.from_cmdstan(sorted(glob.glob("samples/*.csv")))
-else:
-    idata = None
+    if hasattr(az, "from_cmdstan"):                       # arviz < 1
+        csvs = sorted(glob.glob(os.path.join(samples_dir, "*.csv")))
+        try:
+            return az.from_cmdstan(csvs, log_likelihood="log_lik")
+        except Exception:
+            return az.from_cmdstan(csvs)                  # no log_lik in this model
+    from cmdstanpy import from_csv                        # arviz >= 1
+    fit = from_csv(samples_dir)
+    try:
+        return az.from_cmdstanpy(fit, log_likelihood="log_lik")
+    except Exception:
+        return az.from_cmdstanpy(fit)
+
+
+cols = _load_cols("train.csv") if os.path.exists("train.csv") else None
+idata = _load_idata("samples") if os.path.isdir("samples") else None
 
 # ── agent-written code below ──────────────────────────────────────────────────
 '''
