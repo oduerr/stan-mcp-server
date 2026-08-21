@@ -496,3 +496,89 @@ def test_sample_indexes_its_run(tmp_path, monkeypatch):
     r = srv.sample(stan_code="not stan code {{{", data={"N": 1})
     assert r["status"] == "error"                  # compile fails: no run dir created
     assert _read_index(tmp_path) == []             # ...so nothing to index
+
+
+# ── _check_data_shapes (B1): fail fast, never block on uncertainty ─────────────
+
+STAN_DECL = """
+data {
+  int<lower=0> N;               // size scalar
+  vector[N] y;
+  array[N] int<lower=1,upper=J> g;
+  int<lower=1> J;
+  real sigma_prior;             /* scalar */
+  matrix[N, 3] X;               // multi-dim: presence only
+}
+parameters { real mu; }
+model { y ~ normal(mu, 1); }
+"""
+
+
+def test_shape_check_passes_on_consistent_data():
+    data = {"N": 3, "y": [1.0, 2.0, 3.0], "g": [1, 2, 1], "J": 2,
+            "sigma_prior": 1.0, "X": [[1, 2, 3]] * 3}
+    assert srv._check_data_shapes(STAN_DECL, data) is None
+
+
+def test_shape_check_catches_length_mismatch():
+    data = {"N": 302, "y": [0.0] * 305, "g": [1] * 302, "J": 2,
+            "sigma_prior": 1.0, "X": []}
+    msg = srv._check_data_shapes(STAN_DECL, data)
+    assert msg and "'y' has 305 elements" in msg and "= 302" in msg
+
+
+def test_shape_check_catches_missing_variable():
+    data = {"N": 2, "y": [1.0, 2.0], "J": 1, "sigma_prior": 1.0, "X": []}
+    msg = srv._check_data_shapes(STAN_DECL, data)
+    assert msg and "'g' is declared" in msg and "missing" in msg
+
+
+def test_shape_check_stands_down_on_clever_sizes_and_odd_syntax():
+    # size expression it cannot resolve → that var unchecked, rest still checked
+    code = "data { int N; vector[N+1] y; }"
+    assert srv._check_data_shapes(code, {"N": 3, "y": [0.0] * 99}) is None
+    # unrecognised statement anywhere → whole check stands down
+    code = "data { int N; some_new_stan_type<weird>[N] q; vector[N] y; }"
+    assert srv._check_data_shapes(code, {"N": 3}) is None
+    # no data block at all
+    assert srv._check_data_shapes("parameters { real mu; }", {"a": 1}) is None
+    # transformed data must not be mistaken for the data block
+    code = "transformed data { vector[3] c; }\nparameters { real mu; }"
+    assert srv._check_data_shapes(code, {}) is None
+
+
+def test_shape_check_wired_into_sampling_path(tmp_path, monkeypatch):
+    monkeypatch.setattr(srv, "_RESULTS_DIR", tmp_path)
+    r = srv.sample(stan_code="data { int N; vector[N] y; } model { y ~ normal(0,1); }",
+                   data={"N": 3, "y": [1.0, 2.0]})
+    assert r["status"] == "error" and r["stage"] == "data_shape", r
+    assert "nothing was compiled" in r["message"]
+    assert not (tmp_path / "_runs").exists()       # failed before any run dir
+
+
+def test_shape_check_allows_empty_test_vectors():
+    code = "data { int N_test; vector[N_test] x_test; }"
+    assert srv._check_data_shapes(code, {"N_test": 0, "x_test": []}) is None
+
+
+# ── _file_lock (C1/C2): mutual exclusion across processes ──────────────────────
+
+def test_file_lock_excludes_other_processes(tmp_path):
+    import subprocess
+    lock = tmp_path / "x.lock"
+    probe = (
+        "import fcntl, sys\n"
+        f"f = open({str(lock)!r}, 'w')\n"
+        "try:\n"
+        "    fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)\n"
+        "    print('ACQUIRED')\n"
+        "except BlockingIOError:\n"
+        "    print('BLOCKED')\n"
+    )
+    with srv._file_lock(lock):
+        out = subprocess.run([sys.executable, "-c", probe],
+                             capture_output=True, text=True, timeout=30).stdout
+        assert "BLOCKED" in out                 # held here → other process shut out
+    out = subprocess.run([sys.executable, "-c", probe],
+                         capture_output=True, text=True, timeout=30).stdout
+    assert "ACQUIRED" in out                    # released → free again

@@ -242,9 +242,52 @@ async def _http_upload_dataset(
     return _save_dataset(name, train_csv, dataset_md_str)
 
 
-mcp = FastMCP("stan")
+# The instructions string is sent in the MCP initialize handshake and is
+# injected into the agent's system prompt by clients that support it (Claude
+# Code shows it under "MCP Server Instructions") — it is the one channel that
+# reaches an agent BEFORE it decides which tool to look for, so it carries the
+# counter-reflex ("don't pip-install a sampler") and the two usage modes.
+# Keep it short: every token is always-on context in every session.
+mcp = FastMCP(
+    "stan",
+    instructions=(
+        "Use these tools whenever a task involves fitting a Bayesian model, "
+        "MCMC/NUTS sampling, prior or posterior predictive checks, or model "
+        "comparison — rather than installing a sampler yourself. Two modes: "
+        "bring-your-own-data (upload a CSV, then sample(dataset='_uploaded/"
+        "<name>')) and benchmark scoring against a staged held-out test set "
+        "(fit_and_evaluate, returns NLPD). Data and posterior draws stay on "
+        "the server's disk; tools return compact diagnostics and scores, and "
+        "run_python_code (when enabled) returns figures as images. Never "
+        "paste CSV contents into a tool argument — upload instead."
+    ),
+)
 
 # ── Run helpers ────────────────────────────────────────────────────────────────
+
+@contextlib.contextmanager
+def _file_lock(path: Path):
+    """Advisory inter-process lock (POSIX flock); no-op where unavailable.
+
+    Two server instances may share one --datasets/--results dir (e.g. an HTTP
+    instance for Claude Code next to a stdio instance for Claude Desktop).
+    The two spots that are not concurrency-safe by construction take this
+    lock: compiling into the shared model cache, and the read-then-append on
+    a per-dataset log.jsonl.
+    """
+    try:
+        import fcntl  # noqa: PLC0415 - POSIX only; Windows falls through
+    except ImportError:
+        yield
+        return
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "w") as lf:
+        fcntl.flock(lf, fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(lf, fcntl.LOCK_UN)
+
 
 def _make_run_id() -> str:
     return uuid.uuid4().hex[:12]
@@ -292,9 +335,13 @@ def _get_model(stan_code: str):
     _MODEL_CACHE.mkdir(parents=True, exist_ok=True)
     code_hash = hashlib.sha256(stan_code.encode()).hexdigest()[:16]
     model_file = _MODEL_CACHE / f"model_{code_hash}.stan"
-    if not model_file.exists() or model_file.read_text() != stan_code:
-        model_file.write_text(stan_code)
-    return cmdstanpy.CmdStanModel(stan_file=str(model_file))
+    # Locked: two processes asked for the same (hash-identical) model at the
+    # same moment would otherwise both compile to the same binary path — one
+    # execs a half-written file ("Text file busy" / truncated binary).
+    with _file_lock(_MODEL_CACHE / f"model_{code_hash}.lock"):
+        if not model_file.exists() or model_file.read_text() != stan_code:
+            model_file.write_text(stan_code)
+        return cmdstanpy.CmdStanModel(stan_file=str(model_file))
 
 
 # Upper bounds on agent-supplied sampling settings.  The wall-clock guard
@@ -820,6 +867,78 @@ def _scrub_shadow(obj):
 # and asset layout cannot drift apart (they were copy-pasted once and had to be
 # patched in sync).
 
+def _check_data_shapes(stan_code: str, data: dict) -> Optional[str]:
+    """Compare the model's data block against the supplied dict, before compile.
+
+    Catches the transcription-error class (a 305-element array where the model
+    says N=302, a forgotten variable) in milliseconds instead of after a full
+    compile + sampler launch.  Deliberately conservative: it checks only what
+    it confidently parsed — single-dimension sizes that are integer literals
+    or bare names of ints present in `data` — and ANY parse trouble disables
+    the check entirely.  A false "mismatch" would block a legitimate fit; a
+    false pass just falls through to CmdStan's own (slower) error.
+    """
+    try:
+        # The data block: the `data {` not preceded by `transformed`.
+        m = None
+        for cand in re.finditer(r'(transformed\s+)?\bdata\s*\{', stan_code):
+            if not cand.group(1):
+                m = cand
+                break
+        if m is None:
+            return None
+        depth, i = 1, m.end()
+        while i < len(stan_code) and depth:
+            depth += {'{': 1, '}': -1}.get(stan_code[i], 0)
+            i += 1
+        block = stan_code[m.end():i - 1]
+        block = re.sub(r'//[^\n]*', '', block)
+        block = re.sub(r'/\*.*?\*/', '', block, flags=re.DOTALL)
+
+        def resolve(expr: str):
+            expr = expr.strip()
+            if re.fullmatch(r'\d+', expr):
+                return int(expr)
+            if re.fullmatch(r'\w+', expr) and isinstance(data.get(expr), (int, float)):
+                return int(data[expr])
+            return None                              # too clever to check
+
+        problems = []
+        for stmt in block.split(';'):
+            stmt = stmt.strip()
+            if not stmt:
+                continue
+            decl = re.fullmatch(
+                r'(?:array\s*\[(?P<adim>[^\]]+)\]\s*)?'
+                r'(?P<type>int|real|vector|row_vector|simplex|ordered|'
+                r'positive_ordered|unit_vector|matrix|cov_matrix|corr_matrix)'
+                r'(?:\s*<[^>]*>)?'
+                r'(?:\s*\[(?P<tdim>[^\]]+)\])?'
+                r'\s+(?P<name>\w+)', stmt)
+            if decl is None:
+                return None                          # unrecognised syntax: stand down
+            name = decl.group('name')
+            if name not in data:
+                problems.append(f"'{name}' is declared in the data block but missing from the data")
+                continue
+            dims = [d for d in (decl.group('adim'), decl.group('tdim')) if d]
+            if len(dims) != 1 or ',' in dims[0]:
+                continue                             # scalar, or multi-dim: presence only
+            expected = resolve(dims[0])
+            got = data[name]
+            if expected is None or not isinstance(got, (list, tuple)):
+                continue
+            if len(got) != expected:
+                problems.append(
+                    f"'{name}' has {len(got)} elements but the model declares "
+                    f"[{dims[0].strip()}] = {expected}")
+        if problems:
+            return "; ".join(problems) + ". Fix the data (or the declaration) and retry — nothing was compiled or sampled."
+        return None
+    except Exception:
+        return None                                  # never block a fit on our own bug
+
+
 _TIMEOUT_MESSAGE = (
     "Sampling exceeded {limit}s and was stopped. "
     "This usually means the posterior geometry is pathological "
@@ -842,6 +961,10 @@ def _compile_and_sample(stan_code: str, data: dict, config: Optional[dict],
     that got as far as creating a run directory are indexed too, so no directory
     under _runs/ is ever anonymous.
     """
+    shape_problem = _check_data_shapes(stan_code, data)
+    if shape_problem:
+        return {"error": {"status": "error", "stage": "data_shape",
+                          "message": shape_problem}}
     try:
         model = _get_model(stan_code)
     except Exception as exc:
@@ -1162,6 +1285,10 @@ def fit_and_evaluate(
         n_draws=run["cfg"]["chains"] * run["cfg"]["iter_sampling"]))
 
     if dataset is not None:
+      # Locked: iter/improved are computed by read-then-append; concurrent
+      # writers (two instances, or parallel benchmark streams) would
+      # otherwise duplicate iter numbers.
+      with _file_lock(_resolve_under(_RESULTS_DIR, dataset) / "log.jsonl.lock"):
         existing = _read_log(dataset)
         iter_num = len(existing)
         # Only consider an iteration as improved when diagnostics are fully valid.
@@ -1199,17 +1326,21 @@ def sample(
     config: Optional[dict] = None,
     dataset: Optional[str] = None,
 ) -> dict:
-    """Sample from a Stan model and persist posterior draws to disk.
+    """Fit any Stan model to your own data — the general-purpose fitting tool.
 
-    Provide `dataset` (preferred) and/or `data`:
+    No held-out test set is needed (that is `fit_and_evaluate`); use this for
+    one-off analyses, prior-predictive simulation, and uploaded datasets.
 
-    - `dataset` loads the data by name from the server — this works for
-      train-only (uploaded) datasets too: N_train and the `*_train` variables
-      come from train.csv; when no test set exists, N_test is 0 and the
-      `*_test` variables are empty.  Never paste CSV contents into `data` —
-      use the upload endpoint and pass the dataset name instead.
-    - `data` entries override / extend the loaded dict (extra scalars the CSV
-      does not provide).  Passing `data` alone (no `dataset`) uses it as-is.
+    Supplying data, in order of preference:
+
+    1. `dataset="_uploaded/<name>"` — upload the CSV first
+       (get_upload_instructions), then pass the name; the server loads
+       train.csv itself.  Works for staged benchmark datasets too.  For
+       train-only datasets N_test is 0 and `*_test` variables are empty.
+    2. `dataset=...` plus `data={...}` — loaded from CSV, with `data` entries
+       overriding / extending it (extra scalars the CSV does not provide).
+    3. `data={...}` alone — inline dict.  Acceptable for a handful of scalars;
+       never paste CSV-sized arrays into a tool call — upload instead.
 
     Returns scalar diagnostics and a `run_id` only — raw draws are never
     returned inline.  Retrieve them via `samples_path` (directory of per-chain
@@ -1501,6 +1632,12 @@ def get_capabilities() -> dict:
     train_url  = f"{base_url}/train/{{dataset}}" if base_url else "disabled"
     return {
         "server": "stan-mcp-server",
+        "purpose": (
+            "Fit Stan models via CmdStan/NUTS: bring-your-own-data analyses "
+            "(upload CSV + sample) or benchmark scoring on staged held-out "
+            "sets (fit_and_evaluate). Compact JSON out; data and draws stay "
+            "on disk."
+        ),
         "version": _VERSION,
         "tools": _registered_tool_names(),
         "default_sampling_config": _DEFAULT_CONFIG,

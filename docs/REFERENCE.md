@@ -71,6 +71,17 @@ client you use and where the sampling should run.
   simpler — call `run_python_code(run_id=…)` and let the server analyse the
   draws where they already are.
 
+### Running two instances at once
+
+An HTTP instance (for Claude Code) and a stdio instance (for Claude Desktop)
+can share one `--datasets-dir`/`--results-dir`: the stdio instance binds no
+ports, the compile cache and the per-dataset `log.jsonl` are protected by
+inter-process locks, and `run_id`s are random. Fine for assistant use; for
+**benchmark runs keep the server exclusive** — `log.jsonl` is the measurement
+record and a second writer would interleave a foreign session into it. Two
+HTTP instances need distinct `--port`/`--upload-port`. For full isolation,
+give each instance its own `--results-dir`.
+
 ### What stdio changes
 
 | | `streamable-http` (default) | `stdio` |
