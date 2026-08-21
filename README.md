@@ -8,8 +8,10 @@ This is an MCP server for the [Stan](https://mc-stan.org) language. It takes a [
 
 **Ways to use it:**
 
-- *(work in progress)* **As a Stan assistant for your own work.** Let the agent upload your data, then write the model from your verbal description. It does the heavy lifting: fixes the compile errors, runs the sampling, and reports the diagnostics. The workflows we are working towards are collected in [docs/USE_CASES.md](docs/USE_CASES.md).
+- *(work in progress)* **As a Stan assistant for your own work.** Let the agent upload your data, then write the model from your verbal description. It does the heavy lifting: fixes the compile errors, runs the sampling, and reports the diagnostics. The workflows we are working towards are collected in [docs/USE_CASES.md](docs/USE_CASES.md) working prompts can be found at [docs/DEMO_PROMPTS.md](docs/DEMO_PROMPTS.md).
+
 - *(work in progress)* **As an improvement loop on your own data.** Starting from that first model, iterate: check priors, compare variants with PSIS-LOO, and keep what predicts better.
+
 - **As the evaluation server of the [AutoStan](https://github.com/tidit-ch/autostan) project**, where an agent iterates against the NLPD on **held-out data** it never sees: propose a model → fit → read the score → reason → propose a better one.
 
 This could look like:

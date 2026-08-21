@@ -256,6 +256,37 @@ idata = az.from_cmdstan(csvs)
 Run assets are stored under `<results-dir>/_runs/<run_id>/` and are never
 automatically deleted.
 
+### The run index — `<results-dir>/runs.jsonl`
+
+`_runs/` is a flat pile of opaque ids, and the per-dataset `log.jsonl` only
+covers `fit_and_evaluate` calls made with a `dataset` name — `sample` logs
+nowhere else, so assistant-mode runs used to leave directories with no record
+at all. Every tool that creates a run directory now appends one line here,
+**including the failure paths** (sampling timeout, sampler error, missing or
+mis-shaped `log_lik`), so no directory under `_runs/` is anonymous:
+
+```json
+{"run_id": "6406edd5d634", "timestamp": "2026-08-21T14:26:44+00:00",
+ "tool": "fit_and_evaluate", "dataset": "benchmarks/regression_1d",
+ "status": "ok", "runtime_sec": 0.5, "nlpd": 2.2474, "n_draws": 400,
+ "machine": "deepthought", "logs_path": "…/logs.txt", "samples_path": "…"}
+```
+
+`nlpd` is `null` for `sample` (no held-out score). JSONL rather than CSV: free
+text survives, a torn line can be skipped instead of corrupting the parse, and
+new keys do not break old readers. For a spreadsheet:
+
+```python
+import pandas as pd
+pd.read_json("results/runs.jsonl", lines=True).to_csv("runs.csv", index=False)
+```
+
+**Operator-facing only.** No MCP tool reads this file: it spans datasets and
+sessions, which is exactly the L2 leak class `get_run_history` is withheld
+for. Exposing it would need its own row in [TOOL_POLICY.md](../TOOL_POLICY.md).
+Existing installations are not backfilled — the index starts from the first
+run after the upgrade.
+
 ## Datasets
 
 
