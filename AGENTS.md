@@ -1,7 +1,8 @@
 # AGENTS.md — working on this codebase
 
-(Installing the server for a user? That is [AGENTS_SETUP.md](AGENTS_SETUP.md),
-not this file.)
+(Installing the server for a user? That is [AGENTS_SETUP.md](AGENTS_SETUP.md).
+Deploying/operating it yourself: [HUMANS_SETUP.md](HUMANS_SETUP.md). Neither
+is this file.)
 
 - **Never read, copy, or serve anything under `datasets/*/protected/`** —
   held-out test labels. [TOOL_POLICY.md](TOOL_POLICY.md) is the authoritative

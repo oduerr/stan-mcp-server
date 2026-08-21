@@ -582,3 +582,71 @@ def test_file_lock_excludes_other_processes(tmp_path):
     out = subprocess.run([sys.executable, "-c", probe],
                          capture_output=True, text=True, timeout=30).stdout
     assert "ACQUIRED" in out                    # released → free again
+
+
+# ── Documentation consistency ─────────────────────────────────────────────────
+# Some instructions must exist in both setup docs (an agent runbook has to be
+# executable on its own; a human guide has to be readable on its own). Where
+# that duplication is deliberate, pin it — Incident 2 in TOOL_POLICY.md is what
+# documentation drift costs.
+
+REPO_ROOT = Path(__file__).parent
+
+
+def test_setup_docs_agree_on_the_duplicated_commands():
+    agents = (REPO_ROOT / "AGENTS_SETUP.md").read_text()
+    humans = (REPO_ROOT / "HUMANS_SETUP.md").read_text()
+    # cores matters: the cmdstanpy default builds single-threaded (~10x slower)
+    cmdstan = 'cmdstanpy.install_cmdstan(cores=os.cpu_count())'
+    assert cmdstan in agents and cmdstan in humans
+    for doc, name in ((agents, "AGENTS_SETUP"), (humans, "HUMANS_SETUP")):
+        assert "uv pip install -e ." in doc, name
+
+
+def test_client_config_lives_in_one_place():
+    """The Desktop/opencode config shapes are canonical in HUMANS_SETUP."""
+    agents = (REPO_ROOT / "AGENTS_SETUP.md").read_text()
+    humans = (REPO_ROOT / "HUMANS_SETUP.md").read_text()
+    assert '"--transport", "stdio"' in humans          # the form Desktop needs
+    assert "opencode.json" in humans
+    assert '"--transport", "stdio"' not in agents      # linked, not copied
+    assert "HUMANS_SETUP.md#connect-your-client" in agents
+
+
+def test_markdown_links_resolve():
+    import re
+    docs = list(REPO_ROOT.glob("*.md")) + list((REPO_ROOT / "docs").glob("*.md"))
+    broken = []
+    for doc in docs:
+        for target in re.findall(r"\]\((?!http|#)([^)#]+\.md)", doc.read_text()):
+            if not (doc.parent / target).exists():
+                broken.append(f"{doc.name} -> {target}")
+    assert not broken, broken
+
+
+def test_anchor_links_resolve():
+    """In-page and cross-page #anchors must match a real heading."""
+    import re
+    docs = list(REPO_ROOT.glob("*.md")) + list((REPO_ROOT / "docs").glob("*.md"))
+
+    def slugs(text):
+        out = set()
+        for line in text.splitlines():
+            if line.startswith("#"):
+                h = line.lstrip("#").strip().lower()
+                h = re.sub(r"[^\w\s-]", "", h.replace("`", ""))
+                # GitHub maps EACH space to a hyphen, so "a — b" -> "a--b";
+            # collapsing whitespace here would reject correct links.
+            out.add(re.sub(r"\s", "-", h))
+        return out
+
+    broken = []
+    for doc in docs:
+        text = doc.read_text()
+        for target, anchor in re.findall(r"\]\((?!http)([^)#]*)#([^)]+)\)", text):
+            other = (doc.parent / target) if target else doc
+            if target and not other.exists():
+                continue                      # covered by the link test
+            if anchor not in slugs(other.read_text()):
+                broken.append(f"{doc.name} -> {target}#{anchor}")
+    assert not broken, broken
