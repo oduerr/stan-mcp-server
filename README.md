@@ -32,6 +32,7 @@ server: {"nlpd": 1.17, …}          ← oracle for this dataset: 0.94
 | You are…                                                                 | Do this                                                                                                             |
 | ------------------------------------------------------------------------ | ------------------------------------------------------------------------------------------------------------------- |
 | 🙂 **Non-technical** — you use Claude Code, opencode, or a similar agent | Copy the prompt below into your agent and watch                                                                     |
+| 🙂 **Non-technical** — you use Claude Desktop | Desktop cannot install or configure itself (as of August 2026) — do it once by hand: [HUMANS_SETUP.md](HUMANS_SETUP.md#claude-desktop-no-server-to-run) |
 | 🤖 **An agent** told to set this up                                      | Read [AGENTS_SETUP.md](AGENTS_SETUP.md) and follow it step by step                                                        |
 | 🛠️ **Running the server yourself** | [HUMANS_SETUP.md](HUMANS_SETUP.md) — install, transports, remote setups, auth |
 | 🔧 **Technically curious**                                               | [docs/REFERENCE.md](docs/REFERENCE.md) for the full surface, [TOOL_POLICY.md](TOOL_POLICY.md) for the leakage model |
